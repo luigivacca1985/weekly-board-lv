@@ -20,7 +20,7 @@
     // ================== Config & Storage ==================
     const SPECIAL_Q2 = "Q2";
     const DEFAULT_COLUMNS = [SPECIAL_Q2,"MANAGEMENT","HR","MARKETING","VENDITE","AMMINISTRAZIONE","PRODUZIONE","R&D","PERSONALE","DA DELEGARE"];
-    const STORAGE_KEY = "weekly_board_v5"; // nuova versione con Q2 + appuntamenti studio
+    const STORAGE_KEY = "weekly_board_v6"; // versione con Q2 + appuntamenti 60'
 
     const nowISO = () => new Date().toISOString();
     const uid = () => Math.random().toString(36).slice(2,10);
@@ -60,6 +60,12 @@
       const fmt = d => new Date(d).toLocaleDateString('it-IT',{day:'2-digit',month:'2-digit'});
       return `Settimana ${w} • ${fmt(s)} – ${fmt(e)}`;
     }
+    function fmtWeekPeriod(y,w){
+      const s = startOfISOWeek(y,w);
+      const e = new Date(s); e.setUTCDate(s.getUTCDate()+6);
+      const fmt = d => new Date(d).toLocaleDateString('it-IT',{day:'2-digit',month:'2-digit'});
+      return `${fmt(s)}–${fmt(e)}`;
+    }
 
     // ================== Calendario helpers ==================
     const CAL_START_HOUR = 8;    // 08:00
@@ -67,6 +73,8 @@
     const SLOT_MINUTES   = 30;   // passo 30 minuti
     const SLOTS_PER_HOUR = 60 / SLOT_MINUTES;
     const TOTAL_ROWS = (CAL_END_HOUR - CAL_START_HOUR) * SLOTS_PER_HOUR;
+    const TASK_DURATION_MIN = 30;      // i task restano a 30'
+    const STUDY_DURATION_MIN = 60;     // appuntamenti studio a 60'
 
     function dateForCell(year, week, weekdayIndex, slotIndex){
       const start = startOfISOWeek(year, week); // UTC
@@ -90,11 +98,20 @@
       const slotIndex = Math.max(0, Math.min(TOTAL_ROWS-1, Math.round(minutesFromStart / SLOT_MINUTES)));
       return { weekdayIndex, slotIndex };
     }
-    function blockStyleFromDatetime(dtString){
+    function addMinutesToLocal(dtString, minutes){
+      const d = new Date(dtString);
+      const d2 = new Date(d.getTime() + minutes*60000);
+      const pad = n => String(n).padStart(2,'0');
+      const y = d2.getFullYear(), m = pad(d2.getMonth()+1), day = pad(d2.getDate());
+      const hh = pad(d2.getHours()), mm = pad(d2.getMinutes());
+      return `${y}-${m}-${day}T${hh}:${mm}`;
+    }
+    function blockStyleFromDatetime(dtString, durationMin){
       const { slotIndex } = cellForDatetime(dtString);
       const pxPerSlot = 24;
+      const slots = Math.max(1, Math.round(durationMin / SLOT_MINUTES));
       const top = slotIndex * pxPerSlot;
-      const height = pxPerSlot; // 30'
+      const height = pxPerSlot * slots;
       return { top, height };
     }
     function weekdayLabel(year, week, weekdayIndex){
@@ -119,7 +136,7 @@
         __showNotes?: boolean // UI only (backlog)
       }
       StudyEvent = {
-        id, title, note?, datetime: string // "YYYY-MM-DDTHH:mm"
+        id, title, note?, datetime: string // "YYYY-MM-DDTHH:mm", durata fissa 60'
       }
     */
     function initialState(){
@@ -244,7 +261,7 @@
         });
       }
 
-      // ===== Mutazioni Appuntamenti Studio =====
+      // ===== Mutazioni Appuntamenti Studio (60') =====
       function addStudy(title, dt){
         if (!title.trim() || !dt) return;
         setState(prev=>{
@@ -304,7 +321,7 @@
         return a.createdAt.localeCompare(b.createdAt);
       });
 
-      // Appuntamenti studio nella settimana di vista
+      // Appuntamenti studio nella settimana di vista (durata fissa 60')
       const studyEvents = Object.values(state.events || {});
       const studyEventsWeek = studyEvents.filter(ev => {
         if (!ev.datetime) return false;
@@ -533,26 +550,31 @@
                       </div>
                     </div>
 
-                    {/* Appuntamenti Studio */}
+                    {/* Appuntamenti Studio (60') */}
                     <div className="rounded-2xl border bg-white">
-                      <div className="p-3 border-b">Appuntamenti Studio</div>
+                      <div className="p-3 border-b">Appuntamenti Studio (durata 60')</div>
                       <div className="p-3 space-y-3">
                         <StudyForm onAdd={(title,dt)=>addStudy(title,dt)} />
                         <div className="space-y-2">
                           {studyEventsWeek.length===0 && <p className="text-xs text-slate-400">Nessun appuntamento studio in settimana.</p>}
-                          {studyEventsWeek.map(ev=>(
-                            <div key={ev.id} className="rounded-lg border p-2" style={{ background:'#F5F3FF', borderColor:'#C4B5FD' }}>
-                              <div className="text-sm">{ev.title}</div>
-                              <div className="text-xs text-slate-600 mt-1">Orario: {ev.datetime.replace('T',' ')}</div>
-                              <div className="mt-2 flex flex-wrap items-center gap-2">
-                                <input type="datetime-local"
-                                       className="rounded-lg border px-2 py-1 text-xs"
-                                       value={ev.datetime}
-                                       onChange={e=>updateStudy(ev.id,{ datetime: e.target.value })} />
-                                <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>removeStudy(ev.id)}>Elimina</button>
+                          {studyEventsWeek.map(ev=>{
+                            const end = addMinutesToLocal(ev.datetime, STUDY_DURATION_MIN);
+                            return (
+                              <div key={ev.id} className="rounded-lg border p-2" style={{ background:'#F5F3FF', borderColor:'#C4B5FD' }}>
+                                <div className="text-sm">Studio: {ev.title}</div>
+                                <div className="text-xs text-slate-600 mt-1">
+                                  Orario: {ev.datetime.replace('T',' ')} – {end.slice(11)}
+                                </div>
+                                <div className="mt-2 flex flex-wrap items-center gap-2">
+                                  <input type="datetime-local"
+                                         className="rounded-lg border px-2 py-1 text-xs"
+                                         value={ev.datetime}
+                                         onChange={e=>updateStudy(ev.id,{ datetime: e.target.value })} />
+                                  <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>removeStudy(ev.id)}>Elimina</button>
+                                </div>
                               </div>
-                            </div>
-                          ))}
+                            )
+                          })}
                         </div>
                       </div>
                     </div>
@@ -571,8 +593,8 @@
                           const dt = dateForCell(view.year, view.week, weekdayIndex, slotIndex);
                           setCalendarTime(calendarFocusId, dt);
                         } else {
-                          // Se non c'è un'attività selezionata, guidiamo l'utente a creare un appuntamento studio veloce
-                          const title = prompt("Nessuna attività selezionata. Inserisci titolo per un Appuntamento Studio:");
+                          // Se non c'è un'attività selezionata, creiamo un appuntamento studio veloce (60')
+                          const title = prompt("Titolo Appuntamento Studio (60'):"); 
                           if (title) {
                             const dt = dateForCell(view.year, view.week, weekdayIndex, slotIndex);
                             addStudy(title, dt);
@@ -587,7 +609,7 @@
                   Nota: “Fatto” rimuove l’attività sia da <b>SETTIMANA</b> sia da <b>CICLI ATTIVI</b>.  
                   Se non svolta entro la settimana, la riproporrò nella successiva in <span class="text-red-700">rosso</span> (orario da fissare).  
                   Le attività <b>Q2</b> sono evidenziate in <span class="text-amber-700">giallo</span> e non si possono rimuovere dalla settimana.  
-                  Gli <b>Appuntamenti Studio</b> sono indipendenti dai task e compaiono in <span class="text-violet-700">viola</span>.
+                  Gli <b>Appuntamenti Studio</b> durano sempre <b>60 minuti</b> e compaiono in <span class="text-violet-700">viola</span>.
                 </div>
               </section>
             )}
@@ -642,6 +664,9 @@
       const { year: curYear, week: curWeek } = getISOWeek(new Date());
       const [year, setYear] = useState(curYear);
       const [week, setWeek] = useState(curWeek);
+
+      function weekLabel(y,w){ return `W${String(w).padStart(2,'0')} ${fmtWeekPeriod(y,w)}`; }
+
       return (
         <div className="flex items-center gap-1">
           <select className="rounded-lg border px-2 py-1 text-xs" value={String(year)} onChange={e=>setYear(parseInt(e.target.value,10))}>
@@ -651,7 +676,7 @@
           </select>
           <select className="rounded-lg border px-2 py-1 text-xs" value={String(week)} onChange={e=>setWeek(parseInt(e.target.value,10))}>
             {Array.from({length: weeksInYear(year)}).map((_,i)=> {
-              const w = i+1; return <option key={w} value={w}>W{String(w).padStart(2,'0')}</option>
+              const w = i+1; return <option key={w} value={w}>{weekLabel(year,w)}</option>
             })}
           </select>
           <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>onAssign(year, week)}>Assegna</button>
@@ -666,7 +691,7 @@
         <form className="flex flex-wrap items-center gap-2"
               onSubmit={e=>{ e.preventDefault(); onAdd(title, dt); setTitle(''); setDt(''); }}>
           <input className="flex-1 min-w-[220px] rounded-lg border px-2 py-1 text-sm"
-                 placeholder="Titolo appuntamento studio"
+                 placeholder="Titolo appuntamento studio (60')"
                  value={title}
                  onChange={e=>setTitle(e.target.value)} />
           <input type="datetime-local"
@@ -716,14 +741,14 @@
                          className={`border-b border-dashed ${slot%2===0?'bg-white':'bg-slate-50'}`}
                          style={{ height: pxPerSlot }}
                          onClick={()=>onPickSlot(day, slot)}
-                         title="Clicca per assegnare l'orario (task selezionato) o creare un appuntamento studio">
+                         title="Clicca per assegnare l'orario (task selezionato) o creare un appuntamento studio (60')">
                     </div>
                   ))}
 
-                  {/* blocchi attività con orario */}
+                  {/* blocchi attività con orario (30') */}
                   {tasks.filter(t => t.scheduled?.datetime && (cellForDatetime(t.scheduled.datetime).weekdayIndex === day))
                         .map(t=>{
-                          const { top, height } = blockStyleFromDatetime(t.scheduled.datetime);
+                          const { top, height } = blockStyleFromDatetime(t.scheduled.datetime, TASK_DURATION_MIN);
                           const selected = t.id === selectedId;
                           const isQ2 = t.column === SPECIAL_Q2;
                           return (
@@ -742,10 +767,11 @@
                           );
                         })}
 
-                  {/* blocchi appuntamenti studio */}
+                  {/* blocchi appuntamenti studio (60') */}
                   {study.filter(ev => cellForDatetime(ev.datetime).weekdayIndex === day)
                         .map(ev=>{
-                          const { top, height } = blockStyleFromDatetime(ev.datetime);
+                          const { top, height } = blockStyleFromDatetime(ev.datetime, STUDY_DURATION_MIN);
+                          const end = addMinutesToLocal(ev.datetime, STUDY_DURATION_MIN);
                           return (
                             <div key={ev.id}
                                  className="absolute left-1 right-1 rounded-md border px-2 py-1 text-xs overflow-hidden"
@@ -757,7 +783,7 @@
                                  }}
                                  title={ev.title}>
                               <div className="truncate">Studio: {ev.title}</div>
-                              <div className="opacity-70">{ev.datetime.slice(11)}</div>
+                              <div className="opacity-70">{ev.datetime.slice(11)}–{end.slice(11)}</div>
                             </div>
                           );
                         })}
