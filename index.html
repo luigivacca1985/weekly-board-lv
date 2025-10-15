@@ -15,17 +15,19 @@
   <div id="root"></div>
 
   <script type="text/babel">
-    const { useState, useEffect, useMemo, useRef } = React;
+    const { useState, useEffect, useMemo } = React;
 
     // ================== Config & Storage ==================
-    const DEFAULT_COLUMNS = ["MANAGEMENT","HR","MARKETING","VENDITE","AMMINISTRAZIONE","PRODUZIONE","R&D","PERSONALE","DA DELEGARE"];
-    const STORAGE_KEY = "weekly_board_v3"; // nuova versione con calendario visuale
+    const LOCKED_COL = "Q2 Che"; // colonna speciale
+    const DEFAULT_COLUMNS = ["MANAGEMENT","HR","MARKETING","VENDITE","AMMINISTRAZIONE","PRODUZIONE","R&D","PERSONALE","DA DELEGARE", LOCKED_COL];
+    const STORAGE_KEY = "weekly_board_v4_q2che"; // nuova versione
 
     const nowISO = () => new Date().toISOString();
     const uid = () => Math.random().toString(36).slice(2,10);
 
     function load(){ try{ const raw = localStorage.getItem(STORAGE_KEY); if (raw) return JSON.parse(raw);}catch{} return null; }
     function save(data){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }catch{} }
+    const deep = (o)=> JSON.parse(JSON.stringify(o));
 
     // ================== Week / Date utils (ISO) ==================
     function getISOWeek(date){
@@ -60,6 +62,46 @@
       return `Settimana ${w} • ${fmt(s)} – ${fmt(e)}`;
     }
 
+    // ================== Calendario helpers ==================
+    const CAL_START_HOUR = 8;  // 08:00
+    const CAL_END_HOUR   = 20; // 20:00 (escluso)
+    const SLOT_MINUTES   = 30;
+    const SLOTS_PER_HOUR = 60 / SLOT_MINUTES;
+    const TOTAL_ROWS = (CAL_END_HOUR - CAL_START_HOUR) * SLOTS_PER_HOUR;
+
+    function dateForCell(year, week, weekdayIndex, slotIndex){
+      const start = startOfISOWeek(year, week); // UTC
+      const d = new Date(start);
+      d.setUTCDate(start.getUTCDate() + weekdayIndex);
+      const local = new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), CAL_START_HOUR, 0, 0, 0);
+      const minutes = slotIndex * SLOT_MINUTES;
+      local.setMinutes(local.getMinutes() + minutes);
+      const pad = n => String(n).padStart(2,'0');
+      const y = local.getFullYear();
+      const m = pad(local.getMonth()+1);
+      const day = pad(local.getDate());
+      const hh = pad(local.getHours());
+      const mm = pad(local.getMinutes());
+      return `${y}-${m}-${day}T${hh}:${mm}`;
+    }
+    function cellForDatetime(dtString){
+      const dt = new Date(dtString);
+      const weekdayIndex = (dt.getDay()+6)%7; // 0=Mon..6=Sun
+      const minutesFromStart = (dt.getHours() - CAL_START_HOUR) * 60 + dt.getMinutes();
+      const slotIndex = Math.max(0, Math.min(TOTAL_ROWS-1, Math.round(minutesFromStart / SLOT_MINUTES)));
+      return { weekdayIndex, slotIndex };
+    }
+    function blockStyleFromDatetime(dtString){
+      const { slotIndex } = cellForDatetime(dtString);
+      const pxPerSlot = 24;
+      return { top: slotIndex * pxPerSlot, height: pxPerSlot };
+    }
+    function weekdayLabel(year, week, weekdayIndex){
+      const s = startOfISOWeek(year, week);
+      const d = new Date(s); d.setUTCDate(s.getUTCDate()+weekdayIndex);
+      return d.toLocaleDateString('it-IT', { weekday:'short', day:'2-digit', month:'2-digit' });
+    }
+
     // ================== Data model ==================
     /*
       state = {
@@ -71,7 +113,7 @@
         id, text, note, column,
         done: boolean,
         createdAt: ISO,
-        scheduled?: { year:number, week:number, datetime?: string } // datetime = "YYYY-MM-DDTHH:mm" (locale)
+        scheduled?: { year:number, week:number, datetime?: string } // "YYYY-MM-DDTHH:mm" (locale)
       }
     */
     function initialState(){
@@ -81,84 +123,41 @@
         lastRollover: null
       };
     }
-    const deep = (o)=> JSON.parse(JSON.stringify(o));
 
     // ================== Rollover logic ==================
     function doRollover(state, targetYear, targetWeek){
       const copy = deep(state);
-      const tasks = Object.values(copy.tasks);
-      for (const t of tasks){
-        if (t.done) continue;
-        if (!t.scheduled) continue;
+      for (const t of Object.values(copy.tasks)){
+        if (t.done || !t.scheduled) continue;
         const { year, week } = t.scheduled;
         if (year < targetYear || (year === targetYear && week < targetWeek)){
-          // non svolta: riproposta settimana successiva
+          // non svolta: riproposta settimana successiva, senza orario
           let y = year, w = week + 1;
           const max = weeksInYear(y);
           if (w > max) { y = y + 1; w = 1; }
           t.scheduled.year = y;
           t.scheduled.week = w;
-          // orario perso => da fissare
-          delete t.scheduled.datetime;
+          delete t.scheduled.datetime; // diventa "da fissare" (rosso)
         }
       }
       copy.lastRollover = { year: targetYear, week: targetWeek };
       return copy;
     }
 
-    // ================== Helpers calendario ==================
-    const CAL_START_HOUR = 8;    // 08:00
-    const CAL_END_HOUR   = 20;   // 20:00 (escluso)
-    const SLOT_MINUTES   = 30;   // passo 30 minuti
-    const SLOTS_PER_HOUR = 60 / SLOT_MINUTES;
-    const TOTAL_ROWS = (CAL_END_HOUR - CAL_START_HOUR) * SLOTS_PER_HOUR;
-
-    function dateForCell(year, week, weekdayIndex, slotIndex){
-      // weekdayIndex: 0=Mon .. 6=Sun
-      const start = startOfISOWeek(year, week); // UTC
-      const d = new Date(start);
-      d.setUTCDate(start.getUTCDate() + weekdayIndex);
-      // Impostiamo ora/minuti locali
-      const local = new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), CAL_START_HOUR, 0, 0, 0);
-      const minutes = slotIndex * SLOT_MINUTES;
-      local.setMinutes(local.getMinutes() + minutes);
-      // Ritorna stringa per input datetime-local
-      const pad = n => String(n).padStart(2,'0');
-      const y = local.getFullYear();
-      const m = pad(local.getMonth()+1);
-      const day = pad(local.getDate());
-      const hh = pad(local.getHours());
-      const mm = pad(local.getMinutes());
-      return `${y}-${m}-${day}T${hh}:${mm}`;
-    }
-    function cellForDatetime(dtString){
-      // dtString formato "YYYY-MM-DDTHH:mm" (locale)
-      const dt = new Date(dtString);
-      const weekdayIndex = (dt.getDay()+6)%7; // 0=Mon..6=Sun
-      const minutesFromStart = (dt.getHours() - CAL_START_HOUR) * 60 + dt.getMinutes();
-      const slotIndex = Math.max(0, Math.min(TOTAL_ROWS-1, Math.round(minutesFromStart / SLOT_MINUTES)));
-      return { weekdayIndex, slotIndex };
-    }
-    function blockStyleFromDatetime(dtString){
-      const { slotIndex } = cellForDatetime(dtString);
-      const pxPerSlot = 24; // altezza visiva di uno slot (px)
-      const top = slotIndex * pxPerSlot;
-      const height = pxPerSlot; // 30' = 1 slot
-      return { top, height };
-    }
-    function weekdayLabel(year, week, weekdayIndex){
-      const s = startOfISOWeek(year, week);
-      const d = new Date(s); d.setUTCDate(s.getUTCDate()+weekdayIndex);
-      return d.toLocaleDateString('it-IT', { weekday:'short', day:'2-digit', month:'2-digit' });
-    }
-
     // ================== App ==================
     function App(){
       const { year: curYear, week: curWeek } = getISOWeek(new Date());
-      const [state, setState] = useState(()=> load() ?? initialState());
+      const [state, setState] = useState(()=> {
+        const s = load() ?? initialState();
+        // forza presenza colonna LOCKED_COL
+        if (!s.settings.columns.includes(LOCKED_COL)) s.settings.columns.push(LOCKED_COL);
+        return s;
+      });
       const [route, setRoute] = useState(()=> (location.hash.replace('#','') || 'attivi'));
       const [view, setView] = useState({ year: curYear, week: curWeek });
-      const [calendarFocusId, setCalendarFocusId] = useState(null); // id task selezionato in calendario
+      const [calendarFocusId, setCalendarFocusId] = useState(null);
+      const [settingsOpen, setSettingsOpen] = useState(false);
+      const [noteModal, setNoteModal] = useState({ open:false, id:null, text:'' });
 
       // Persistenza
       useEffect(()=>{ save(state); }, [state]);
@@ -171,7 +170,7 @@
         return ()=> window.removeEventListener('hashchange', onHash);
       }, []);
 
-      // Rollover automatico all'apertura in nuova settimana
+      // Rollover automatico
       useEffect(()=>{
         const t = getISOWeek(new Date());
         if (isAfterWeek(t, state.lastRollover)) {
@@ -207,7 +206,7 @@
         setState(prev=>{
           const copy = deep(prev);
           const t = copy.tasks[id]; if (!t) return copy;
-          t.scheduled = { year, week }; // senza datetime => rosso (da fissare)
+          t.scheduled = { year, week }; // senza datetime => rosso
           return copy;
         });
         location.hash = 'settimana';
@@ -229,14 +228,40 @@
         });
       }
 
-      // Filtri
+      // Colonne modificabili (LOCKED_COL non rimovibile)
+      function applyColumns(newCols) {
+        const cols = newCols.map(s => s.trim()).filter(Boolean);
+        let unique = Array.from(new Set(cols));
+        if (!unique.includes(LOCKED_COL)) unique.push(LOCKED_COL); // garantisce presenza
+        setState(prev => {
+          const copy = deep(prev);
+          const prevFirst = copy.settings.columns[0] || unique[0];
+          copy.settings.columns = unique;
+          const fallback = unique[0] || prevFirst;
+          for (const t of Object.values(copy.tasks)) {
+            if (!unique.includes(t.column)) t.column = fallback;
+          }
+          return copy;
+        });
+      }
+
+      // Filtri:
       const tasksArray = Object.values(state.tasks);
-      const backlogTasks = tasksArray.filter(t => !t.done && !t.scheduled); // CICLI ATTIVI
-      const weekTasks = tasksArray.filter(t => !t.done && t.scheduled && t.scheduled.year === view.year && t.scheduled.week === view.week);
+
+      // CICLI ATTIVI: tutte le attività non fatte e NON pianificate, MA per LOCKED_COL
+      // devono comparire anche se pianificate (permangono fino a "Fatto").
+      const backlogTasks = tasksArray.filter(t =>
+        !t.done && ( !t.scheduled || t.column === LOCKED_COL )
+      );
+
+      const weekTasks = tasksArray.filter(t =>
+        !t.done && t.scheduled && t.scheduled.year === view.year && t.scheduled.week === view.week
+      );
+
       const weekTasksOrdered = [...weekTasks].sort((a,b)=>{
         const aHas = a.scheduled?.datetime ? 1 : 0;
         const bHas = b.scheduled?.datetime ? 1 : 0;
-        if (aHas !== bHas) return aHas - bHas; // senza orario prima
+        if (aHas !== bHas) return aHas - bHas; // senza orario (rossi) prima
         return a.createdAt.localeCompare(b.createdAt);
       });
 
@@ -272,7 +297,7 @@
         );
       }
 
-      // ============ Render pages ============
+      // ============ Render ============
       return (
         <div className="min-h-screen">
           {/* Navbar */}
@@ -288,10 +313,11 @@
                 const t = getISOWeek(new Date());
                 setState(s => doRollover(s, t.year, t.week));
               }}>Esegui rollover</button>
+              <button className="px-3 py-2 rounded-xl border text-sm" onClick={()=>setSettingsOpen(true)}>Impostazioni</button>
             </div>
           </header>
 
-          {/* Page content */}
+          {/* Contenuto */}
           <main className="max-w-7xl mx-auto p-4 space-y-6">
 
             {/* CICLI ATTIVI */}
@@ -311,16 +337,28 @@
                         </div>
                         <div className="p-3 space-y-2">
                           {items.length===0 && <p className="text-xs text-slate-400">Nessuna attività.</p>}
-                          {items.map(t => (
-                            <div key={t.id} className="rounded-lg border p-2 bg-white">
-                              <div className="text-sm">{t.text}</div>
-                              {t.note && <div className="text-xs text-slate-500 mt-1 whitespace-pre-wrap">{t.note}</div>}
-                              <div className="mt-2 flex items-center gap-2">
-                                <AssignWeek onAssign={(y,w)=>assignToWeek(t.id,y,w)} />
-                                <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>removeTask(t.id)}>Elimina</button>
+                          {items.map(t => {
+                            const isLocked = t.column === LOCKED_COL;
+                            return (
+                              <div key={t.id} className={`rounded-lg border p-2 ${isLocked ? 'bg-amber-100 border-amber-300' : 'bg-white'}`}>
+                                <div className="text-sm">{t.text}</div>
+                                {t.note && <div className="text-xs text-slate-600 mt-1 whitespace-pre-wrap">Note: {t.note}</div>}
+                                <div className="mt-2 flex flex-wrap items-center gap-2">
+                                  {/* Note: sempre disponibile per LOCKED_COL */}
+                                  {isLocked && (
+                                    <button className="px-2 py-1 rounded-lg border text-xs"
+                                            onClick={()=> setNoteModal({open:true, id:t.id, text:(t.note||'')})}>
+                                      Note
+                                    </button>
+                                  )}
+                                  {/* Assegna settimana: sempre consentito, ma l’elemento resta in backlog finché non fatto */}
+                                  <AssignWeek onAssign={(y,w)=>assignToWeek(t.id,y,w)} />
+                                  {/* Elimina: disponibile, ma sconsigliato per LOCKED_COL (lasciamo la scelta) */}
+                                  <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>removeTask(t.id)}>Elimina</button>
+                                </div>
                               </div>
-                            </div>
-                          ))}
+                            )
+                          })}
                         </div>
                       </div>
                     )
@@ -343,30 +381,46 @@
                     return (
                       <div key={col} className="rounded-2xl border bg-white">
                         <div className="p-3 border-b flex items-center justify-between">
-                          <div className="font-medium">{col}</div>
+                          <div className="font-medium">{col}{col===LOCKED_COL && ' (bloccata)'}</div>
                           <div className="text-xs text-slate-500">{items.length} attività</div>
                         </div>
                         <div className="p-3 space-y-2">
                           {items.length===0 && <p className="text-xs text-slate-400">Nessuna attività.</p>}
                           {items.map(t => {
+                            const isLocked = t.column === LOCKED_COL;
                             const needsTime = !(t.scheduled && t.scheduled.datetime);
+                            const baseColor = isLocked ? 'bg-amber-100 border-amber-300'
+                                                       : (needsTime ? 'bg-red-50 border-red-300' : 'bg-white');
                             return (
-                              <div key={t.id} className={`rounded-lg border p-2 ${needsTime ? 'bg-red-50 border-red-300' : 'bg-white'}`}>
+                              <div key={t.id} className={`rounded-lg border p-2 ${baseColor}`}>
                                 <div className="flex items-start gap-2">
+                                  {/* Solo toggle "Fatto" è consentito per LOCKED_COL */}
                                   <input type="checkbox" className="mt-1" checked={!!t.done}
                                     onChange={e=> e.target.checked ? markDone(t.id) : updateTask(t.id,{done:false})}
                                     title={t.done?'Segna come non fatto':'Segna come fatto'} />
                                   <div className="mr-auto">
                                     <div className={`text-sm ${t.done?'line-through text-slate-400':''}`}>{t.text}</div>
-                                    {needsTime && <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>}
+                                    {t.note && <div className="text-xs text-slate-600 mt-1 whitespace-pre-wrap">Note: {t.note}</div>}
+                                    {(!isLocked && needsTime) && <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>}
                                     {t.scheduled?.datetime && <div className="text-xs text-slate-500 mt-1">Orario: {t.scheduled.datetime.replace('T',' ')}</div>}
                                   </div>
                                   <div className="flex gap-1">
-                                    <button className="px-2 py-1 rounded-lg border text-xs"
-                                      onClick={()=>{ setCalendarFocusId(t.id); location.hash='calendario'; }}>
-                                      Calendario
-                                    </button>
-                                    <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>updateTask(t.id,{scheduled:undefined})}>Rimuovi dalla settimana</button>
+                                    {!isLocked && (
+                                      <>
+                                        <button className="px-2 py-1 rounded-lg border text-xs"
+                                          onClick={()=>{ setCalendarFocusId(t.id); location.hash='calendario'; }}>
+                                          Calendario
+                                        </button>
+                                        <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>updateTask(t.id,{scheduled:undefined})}>
+                                          Rimuovi
+                                        </button>
+                                      </>
+                                    )}
+                                    {isLocked && (
+                                      <span className="px-2 py-1 rounded-lg border text-[11px] text-amber-800 border-amber-300 bg-amber-50" title="Attività non modificabile">
+                                        Bloccata
+                                      </span>
+                                    )}
                                   </div>
                                 </div>
                               </div>
@@ -389,29 +443,35 @@
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-                  {/* Pannello sinistro: elenco attività della settimana */}
+                  {/* Elenco attività settimana */}
                   <div className="lg:col-span-1 rounded-2xl border bg-white">
                     <div className="p-3 border-b">Attività della settimana</div>
                     <div className="p-3 space-y-2">
                       {weekTasksOrdered.length===0 && <p className="text-xs text-slate-400">Nessuna attività in settimana.</p>}
                       {weekTasksOrdered.map(t=>{
                         const selected = calendarFocusId === t.id;
+                        const isLocked = t.column === LOCKED_COL;
                         const needsTime = !(t.scheduled && t.scheduled.datetime);
                         return (
                           <div key={t.id}
-                               className={`rounded-lg border p-2 cursor-pointer ${selected ? 'ring-2 ring-slate-900' : ''} ${needsTime?'bg-red-50 border-red-300':'bg-white'}`}
+                               className={`rounded-lg border p-2 cursor-pointer ${selected ? 'ring-2 ring-slate-900' : ''} ${isLocked ? 'bg-amber-100 border-amber-300' : (needsTime?'bg-red-50 border-red-300':'bg-white')}`}
                                onClick={()=>setCalendarFocusId(t.id)}>
                             <div className="text-sm">{t.text}</div>
                             {t.scheduled?.datetime
                               ? <div className="text-xs text-slate-500 mt-1">Orario: {t.scheduled.datetime.replace('T',' ')}</div>
-                              : <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>}
-                            <div className="mt-2 flex gap-2">
+                              : (!isLocked && <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>)}
+                            <div className="mt-2 flex gap-2 items-center">
                               <input type="datetime-local"
-                                     className="rounded-lg border px-2 py-1 text-xs"
+                                     className="rounded-lg border px-2 py-1 text-xs disabled:bg-slate-100 disabled:text-slate-400"
                                      value={t.scheduled?.datetime || ''}
-                                     onChange={e=>setCalendarTime(t.id, e.target.value)} />
+                                     onChange={e=>setCalendarTime(t.id, e.target.value)}
+                                     disabled={isLocked}
+                              />
                               <button className="px-2 py-1 rounded-lg border text-xs bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700"
-                                      onClick={()=>markDone(t.id)}>Fatto ✓</button>
+                                      onClick={()=>markDone(t.id)}>
+                                Fatto ✓
+                              </button>
+                              {isLocked && <span className="text-[11px] text-amber-700">Non pianificabile</span>}
                             </div>
                           </div>
                         )
@@ -428,6 +488,8 @@
                       selectedId={calendarFocusId}
                       onPickSlot={(weekdayIndex, slotIndex)=>{
                         if (!calendarFocusId) return alert("Seleziona prima un'attività a sinistra.");
+                        const selected = state.tasks[calendarFocusId];
+                        if (selected?.column === LOCKED_COL) return alert("Le attività 'Q2 Che' non sono pianificabili.");
                         const dt = dateForCell(view.year, view.week, weekdayIndex, slotIndex);
                         setCalendarTime(calendarFocusId, dt);
                       }}
@@ -436,12 +498,63 @@
                 </div>
 
                 <div className="text-xs text-slate-500">
-                  Nota: “Fatto” rimuove l’attività sia da **SETTIMANA** sia da **CICLI ATTIVI**.  
-                  Se non svolta entro la settimana, la riproporrò nella successiva in **rosso** finché non fisserà l’orario.
+                  Nota: “Fatto” rimuove l’attività sia da **SETTIMANA** sia da **CICLI ATTIVI**.
+                  Le attività “Q2 Che” restano in **CICLI ATTIVI** finché non vengono completate.
                 </div>
               </section>
             )}
           </main>
+
+          {/* Modale Impostazioni */}
+          {settingsOpen && (
+            <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={()=>setSettingsOpen(false)}>
+              <div className="w-full max-w-2xl rounded-2xl bg-white shadow-xl" onClick={(e)=>e.stopPropagation()}>
+                <div className="p-4 border-b rounded-t-2xl">
+                  <div className="text-base font-semibold">Impostazioni</div>
+                </div>
+                <div className="p-4 space-y-3">
+                  <label className="text-xs font-medium text-slate-600">Etichette colonne (una per riga)</label>
+                  <EditableColumns
+                    initial={state.settings.columns}
+                    lockedLabel={LOCKED_COL}
+                    onApply={(cols)=>{ applyColumns(cols); setSettingsOpen(false); }}
+                  />
+                  <p className="text-xs text-slate-500">
+                    La colonna <b>{LOCKED_COL}</b> è obbligatoria e non può essere rimossa.
+                  </p>
+                </div>
+                <div className="p-3 border-t flex justify-end">
+                  <button className="px-3 py-2 rounded-xl border text-sm" onClick={()=>setSettingsOpen(false)}>Chiudi</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Modale Note per backlog (Q2 Che) */}
+          {noteModal.open && (
+            <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={()=>setNoteModal({open:false,id:null,text:''})}>
+              <div className="w-full max-w-lg rounded-2xl bg-white shadow-xl" onClick={e=>e.stopPropagation()}>
+                <div className="p-4 border-b rounded-t-2xl">
+                  <div className="text-base font-semibold">Note attività</div>
+                </div>
+                <div className="p-4 space-y-2">
+                  <textarea rows="8" className="w-full rounded-xl border px-3 py-2 text-sm"
+                            value={noteModal.text}
+                            onChange={e=>setNoteModal(m=>({...m, text:e.target.value}))}></textarea>
+                </div>
+                <div className="p-3 border-t flex justify-end gap-2">
+                  <button className="px-3 py-2 rounded-xl border text-sm" onClick={()=>setNoteModal({open:false,id:null,text:''})}>Annulla</button>
+                  <button className="px-3 py-2 rounded-xl border text-sm bg-slate-900 text-white"
+                          onClick={()=>{
+                            if (noteModal.id) updateTask(noteModal.id, { note: noteModal.text });
+                            setNoteModal({open:false,id:null,text:''});
+                          }}>
+                    Salva
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       );
     }
@@ -485,8 +598,6 @@
     }
 
     function CalendarGrid({ year, week, tasks, selectedId, onPickSlot }){
-      // Colonne: 7 giorni (lun-dom)
-      // Righe: slot da 30' (08:00-20:00)
       const pxPerSlot = 24;
       const hours = Array.from({length: CAL_END_HOUR - CAL_START_HOUR}, (_,i)=> CAL_START_HOUR + i);
       const slots = Array.from({length: TOTAL_ROWS}, (_,i)=> i);
@@ -506,7 +617,7 @@
           {/* Corpo: griglia oraria */}
           <div className="relative">
             <div className="grid" style={{ gridTemplateColumns: '80px repeat(7, 1fr)' }}>
-              {/* Colonna degli orari */}
+              {/* Colonna orari */}
               <div className="border-r">
                 {hours.map(h=>(
                   <div key={h} className="h-12 border-b text-[11px] text-slate-500 flex items-start justify-end pr-2">
@@ -515,10 +626,10 @@
                 ))}
               </div>
 
-              {/* Le 7 colonne dei giorni */}
+              {/* 7 colonne dei giorni */}
               {Array.from({length:7}, (_,day)=>(
                 <div key={day} className="relative border-r" style={{ height: pxPerSlot*TOTAL_ROWS }}>
-                  {/* griglia slot cliccabili */}
+                  {/* slot cliccabili */}
                   {slots.map(slot=>(
                     <div key={slot}
                          className={`border-b border-dashed ${slot%2===0?'bg-white':'bg-slate-50'}`}
@@ -528,15 +639,18 @@
                     </div>
                   ))}
 
-                  {/* render tasks del giorno come blocchi posizionati */}
+                  {/* blocchi attività con orario */}
                   {tasks.filter(t => t.scheduled?.datetime && (cellForDatetime(t.scheduled.datetime).weekdayIndex === day))
                         .map(t=>{
                           const { top, height } = blockStyleFromDatetime(t.scheduled.datetime);
                           const selected = t.id === selectedId;
+                          const isLocked = t.column === "Q2 Che";
                           return (
                             <div key={t.id}
                                  className={`absolute left-1 right-1 rounded-md border px-2 py-1 text-xs overflow-hidden ${selected?'ring-2 ring-slate-900':''}`}
-                                 style={{ top, height, background: '#DBEAFE', borderColor: '#93C5FD' }}
+                                 style={{ top, height,
+                                          background: isLocked ? '#FDE68A' : '#DBEAFE',
+                                          borderColor: isLocked ? '#F59E0B' : '#93C5FD' }}
                                  title={t.text}>
                               <div className="truncate">{t.text}</div>
                               <div className="opacity-70">{t.scheduled.datetime.slice(11)}</div>
@@ -546,6 +660,34 @@
                 </div>
               ))}
             </div>
+          </div>
+        </div>
+      );
+    }
+
+    function EditableColumns({ initial, lockedLabel, onApply }) {
+      const [value, setValue] = React.useState((initial || []).join('\n'));
+      React.useEffect(()=> setValue((initial || []).join('\n')), [initial]);
+
+      function handleApply() {
+        const lines = value.split(/\r?\n/);
+        onApply(lines);
+      }
+
+      return (
+        <div className="space-y-2">
+          <textarea
+            rows="8"
+            className="w-full rounded-xl border px-3 py-2 text-sm"
+            value={value}
+            onChange={e=>setValue(e.target.value)}
+            placeholder={'MANAGEMENT\nHR\nMARKETING\n...'}
+          />
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] text-slate-500">La colonna “{lockedLabel}” è obbligatoria e non può essere rimossa.</span>
+            <button className="px-3 py-2 rounded-xl border text-sm" onClick={handleApply}>
+              Applica
+            </button>
           </div>
         </div>
       );
