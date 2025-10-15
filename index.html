@@ -15,19 +15,18 @@
   <div id="root"></div>
 
   <script type="text/babel">
-    const { useState, useEffect, useMemo } = React;
+    const { useState, useEffect } = React;
 
     // ================== Config & Storage ==================
-    const LOCKED_COL = "Q2 Che"; // colonna speciale
-    const DEFAULT_COLUMNS = ["MANAGEMENT","HR","MARKETING","VENDITE","AMMINISTRAZIONE","PRODUZIONE","R&D","PERSONALE","DA DELEGARE", LOCKED_COL];
-    const STORAGE_KEY = "weekly_board_v4_q2che"; // nuova versione
+    const SPECIAL_Q2 = "Q2 Che"; // colonna speciale
+    const DEFAULT_COLUMNS = [SPECIAL_Q2,"MANAGEMENT","HR","MARKETING","VENDITE","AMMINISTRAZIONE","PRODUZIONE","R&D","PERSONALE","DA DELEGARE"];
+    const STORAGE_KEY = "weekly_board_v3_q2che"; // storage versione con Q2 Che
 
     const nowISO = () => new Date().toISOString();
     const uid = () => Math.random().toString(36).slice(2,10);
 
     function load(){ try{ const raw = localStorage.getItem(STORAGE_KEY); if (raw) return JSON.parse(raw);}catch{} return null; }
     function save(data){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }catch{} }
-    const deep = (o)=> JSON.parse(JSON.stringify(o));
 
     // ================== Week / Date utils (ISO) ==================
     function getISOWeek(date){
@@ -63,9 +62,9 @@
     }
 
     // ================== Calendario helpers ==================
-    const CAL_START_HOUR = 8;  // 08:00
-    const CAL_END_HOUR   = 20; // 20:00 (escluso)
-    const SLOT_MINUTES   = 30;
+    const CAL_START_HOUR = 8;    // 08:00
+    const CAL_END_HOUR   = 20;   // 20:00 (escluso)
+    const SLOT_MINUTES   = 30;   // 30'
     const SLOTS_PER_HOUR = 60 / SLOT_MINUTES;
     const TOTAL_ROWS = (CAL_END_HOUR - CAL_START_HOUR) * SLOTS_PER_HOUR;
 
@@ -94,7 +93,9 @@
     function blockStyleFromDatetime(dtString){
       const { slotIndex } = cellForDatetime(dtString);
       const pxPerSlot = 24;
-      return { top: slotIndex * pxPerSlot, height: pxPerSlot };
+      const top = slotIndex * pxPerSlot;
+      const height = pxPerSlot; // 30'
+      return { top, height };
     }
     function weekdayLabel(year, week, weekdayIndex){
       const s = startOfISOWeek(year, week);
@@ -113,6 +114,7 @@
         id, text, note, column,
         done: boolean,
         createdAt: ISO,
+        __showNotes?: boolean, // solo UI
         scheduled?: { year:number, week:number, datetime?: string } // "YYYY-MM-DDTHH:mm" (locale)
       }
     */
@@ -123,12 +125,15 @@
         lastRollover: null
       };
     }
+    const deep = (o)=> JSON.parse(JSON.stringify(o));
 
     // ================== Rollover logic ==================
     function doRollover(state, targetYear, targetWeek){
       const copy = deep(state);
-      for (const t of Object.values(copy.tasks)){
-        if (t.done || !t.scheduled) continue;
+      const tasks = Object.values(copy.tasks);
+      for (const t of tasks){
+        if (t.done) continue;
+        if (!t.scheduled) continue;
         const { year, week } = t.scheduled;
         if (year < targetYear || (year === targetYear && week < targetWeek)){
           // non svolta: riproposta settimana successiva, senza orario
@@ -148,16 +153,19 @@
     function App(){
       const { year: curYear, week: curWeek } = getISOWeek(new Date());
       const [state, setState] = useState(()=> {
-        const s = load() ?? initialState();
-        // forza presenza colonna LOCKED_COL
-        if (!s.settings.columns.includes(LOCKED_COL)) s.settings.columns.push(LOCKED_COL);
-        return s;
+        const loaded = load();
+        // garantisce che SPECIAL_Q2 esista e sia prima
+        if (loaded?.settings?.columns) {
+          const cols = loaded.settings.columns;
+          if (!cols.includes(SPECIAL_Q2)) loaded.settings.columns = [SPECIAL_Q2, ...cols];
+          else loaded.settings.columns = [SPECIAL_Q2, ...cols.filter(c=>c!==SPECIAL_Q2)];
+        }
+        return loaded ?? initialState();
       });
       const [route, setRoute] = useState(()=> (location.hash.replace('#','') || 'attivi'));
       const [view, setView] = useState({ year: curYear, week: curWeek });
       const [calendarFocusId, setCalendarFocusId] = useState(null);
       const [settingsOpen, setSettingsOpen] = useState(false);
-      const [noteModal, setNoteModal] = useState({ open:false, id:null, text:'' });
 
       // Persistenza
       useEffect(()=>{ save(state); }, [state]);
@@ -228,15 +236,18 @@
         });
       }
 
-      // Colonne modificabili (LOCKED_COL non rimovibile)
+      // Colonne modificabili (ma Q2 Che sempre presente e prima)
       function applyColumns(newCols) {
         const cols = newCols.map(s => s.trim()).filter(Boolean);
         let unique = Array.from(new Set(cols));
-        if (!unique.includes(LOCKED_COL)) unique.push(LOCKED_COL); // garantisce presenza
+        if (!unique.includes(SPECIAL_Q2)) unique.unshift(SPECIAL_Q2);
+        else unique = [SPECIAL_Q2, ...unique.filter(c => c !== SPECIAL_Q2)];
+
         setState(prev => {
           const copy = deep(prev);
           const prevFirst = copy.settings.columns[0] || unique[0];
           copy.settings.columns = unique;
+          // riassegna le attività con colonna non più presente
           const fallback = unique[0] || prevFirst;
           for (const t of Object.values(copy.tasks)) {
             if (!unique.includes(t.column)) t.column = fallback;
@@ -245,13 +256,12 @@
         });
       }
 
-      // Filtri:
+      // Filtri
       const tasksArray = Object.values(state.tasks);
 
-      // CICLI ATTIVI: tutte le attività non fatte e NON pianificate, MA per LOCKED_COL
-      // devono comparire anche se pianificate (permangono fino a "Fatto").
+      // CICLI ATTIVI: Q2 Che resta visibile anche se scheduled
       const backlogTasks = tasksArray.filter(t =>
-        !t.done && ( !t.scheduled || t.column === LOCKED_COL )
+        !t.done && (t.column === SPECIAL_Q2 || !t.scheduled)
       );
 
       const weekTasks = tasksArray.filter(t =>
@@ -327,7 +337,11 @@
                 <AddBacklogForm columns={state.settings.columns} onAdd={addBacklog} />
 
                 <div className="grid md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-                  {state.settings.columns.map(col=>{
+                  {[...state.settings.columns].sort((a,b)=>{
+                    if (a === SPECIAL_Q2) return -1;
+                    if (b === SPECIAL_Q2) return 1;
+                    return a.localeCompare(b);
+                  }).map(col=>{
                     const items = backlogTasks.filter(t=>t.column===col);
                     return (
                       <div key={col} className="rounded-2xl border bg-white">
@@ -337,28 +351,33 @@
                         </div>
                         <div className="p-3 space-y-2">
                           {items.length===0 && <p className="text-xs text-slate-400">Nessuna attività.</p>}
-                          {items.map(t => {
-                            const isLocked = t.column === LOCKED_COL;
-                            return (
-                              <div key={t.id} className={`rounded-lg border p-2 ${isLocked ? 'bg-amber-100 border-amber-300' : 'bg-white'}`}>
-                                <div className="text-sm">{t.text}</div>
-                                {t.note && <div className="text-xs text-slate-600 mt-1 whitespace-pre-wrap">Note: {t.note}</div>}
-                                <div className="mt-2 flex flex-wrap items-center gap-2">
-                                  {/* Note: sempre disponibile per LOCKED_COL */}
-                                  {isLocked && (
-                                    <button className="px-2 py-1 rounded-lg border text-xs"
-                                            onClick={()=> setNoteModal({open:true, id:t.id, text:(t.note||'')})}>
-                                      Note
-                                    </button>
-                                  )}
-                                  {/* Assegna settimana: sempre consentito, ma l’elemento resta in backlog finché non fatto */}
-                                  <AssignWeek onAssign={(y,w)=>assignToWeek(t.id,y,w)} />
-                                  {/* Elimina: disponibile, ma sconsigliato per LOCKED_COL (lasciamo la scelta) */}
-                                  <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>removeTask(t.id)}>Elimina</button>
-                                </div>
+                          {items.map(t => (
+                            <div key={t.id} className="rounded-lg border p-2 bg-white">
+                              <div className="text-sm">{t.text}</div>
+                              {t.note && <div className="text-xs text-slate-500 mt-1 whitespace-pre-wrap">{t.note}</div>}
+                              <div className="mt-2 flex items-center gap-2">
+                                <AssignWeek onAssign={(y,w)=>assignToWeek(t.id,y,w)} />
+                                <button
+                                  className="px-2 py-1 rounded-lg border text-xs"
+                                  onClick={() => updateTask(t.id, { __showNotes: !t.__showNotes })}
+                                >Note</button>
+                                <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>removeTask(t.id)}>Elimina</button>
                               </div>
-                            )
-                          })}
+
+                              {/* Editor note a comparsa */}
+                              {t.__showNotes && (
+                                <div className="mt-2">
+                                  <textarea
+                                    rows="3"
+                                    className="w-full rounded-lg border px-2 py-1 text-sm"
+                                    value={t.note || ''}
+                                    onChange={e=>updateTask(t.id, { note: e.target.value })}
+                                    placeholder="Aggiungi note..."
+                                  ></textarea>
+                                </div>
+                              )}
+                            </div>
+                          ))}
                         </div>
                       </div>
                     )
@@ -381,45 +400,39 @@
                     return (
                       <div key={col} className="rounded-2xl border bg-white">
                         <div className="p-3 border-b flex items-center justify-between">
-                          <div className="font-medium">{col}{col===LOCKED_COL && ' (bloccata)'}</div>
+                          <div className="font-medium">{col}</div>
                           <div className="text-xs text-slate-500">{items.length} attività</div>
                         </div>
                         <div className="p-3 space-y-2">
                           {items.length===0 && <p className="text-xs text-slate-400">Nessuna attività.</p>}
                           {items.map(t => {
-                            const isLocked = t.column === LOCKED_COL;
                             const needsTime = !(t.scheduled && t.scheduled.datetime);
-                            const baseColor = isLocked ? 'bg-amber-100 border-amber-300'
-                                                       : (needsTime ? 'bg-red-50 border-red-300' : 'bg-white');
+                            const isQ2 = t.column === SPECIAL_Q2;
                             return (
-                              <div key={t.id} className={`rounded-lg border p-2 ${baseColor}`}>
+                              <div key={t.id}
+                                   className={`rounded-lg border p-2 ${
+                                     isQ2 ? 'bg-yellow-50 border-yellow-300'
+                                          : (needsTime ? 'bg-red-50 border-red-300' : 'bg-white')
+                                   }`}>
                                 <div className="flex items-start gap-2">
-                                  {/* Solo toggle "Fatto" è consentito per LOCKED_COL */}
                                   <input type="checkbox" className="mt-1" checked={!!t.done}
                                     onChange={e=> e.target.checked ? markDone(t.id) : updateTask(t.id,{done:false})}
                                     title={t.done?'Segna come non fatto':'Segna come fatto'} />
                                   <div className="mr-auto">
                                     <div className={`text-sm ${t.done?'line-through text-slate-400':''}`}>{t.text}</div>
-                                    {t.note && <div className="text-xs text-slate-600 mt-1 whitespace-pre-wrap">Note: {t.note}</div>}
-                                    {(!isLocked && needsTime) && <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>}
+                                    {isQ2 && <div className="text-[11px] text-amber-700 mt-1">Q2 Che</div>}
+                                    {!isQ2 && needsTime && <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>}
                                     {t.scheduled?.datetime && <div className="text-xs text-slate-500 mt-1">Orario: {t.scheduled.datetime.replace('T',' ')}</div>}
                                   </div>
                                   <div className="flex gap-1">
-                                    {!isLocked && (
-                                      <>
-                                        <button className="px-2 py-1 rounded-lg border text-xs"
-                                          onClick={()=>{ setCalendarFocusId(t.id); location.hash='calendario'; }}>
-                                          Calendario
-                                        </button>
-                                        <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>updateTask(t.id,{scheduled:undefined})}>
-                                          Rimuovi
-                                        </button>
-                                      </>
-                                    )}
-                                    {isLocked && (
-                                      <span className="px-2 py-1 rounded-lg border text-[11px] text-amber-800 border-amber-300 bg-amber-50" title="Attività non modificabile">
-                                        Bloccata
-                                      </span>
+                                    <button className="px-2 py-1 rounded-lg border text-xs"
+                                      onClick={()=>{ setCalendarFocusId(t.id); location.hash='calendario'; }}>
+                                      Calendario
+                                    </button>
+                                    {!isQ2 && (
+                                      <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>updateTask(t.id,{scheduled:undefined})}>
+                                        Rimuovi dalla settimana
+                                      </button>
                                     )}
                                   </div>
                                 </div>
@@ -450,28 +463,27 @@
                       {weekTasksOrdered.length===0 && <p className="text-xs text-slate-400">Nessuna attività in settimana.</p>}
                       {weekTasksOrdered.map(t=>{
                         const selected = calendarFocusId === t.id;
-                        const isLocked = t.column === LOCKED_COL;
                         const needsTime = !(t.scheduled && t.scheduled.datetime);
+                        const isQ2 = t.column === SPECIAL_Q2;
                         return (
                           <div key={t.id}
-                               className={`rounded-lg border p-2 cursor-pointer ${selected ? 'ring-2 ring-slate-900' : ''} ${isLocked ? 'bg-amber-100 border-amber-300' : (needsTime?'bg-red-50 border-red-300':'bg-white')}`}
+                               className={`rounded-lg border p-2 cursor-pointer ${selected ? 'ring-2 ring-slate-900' : ''} ${
+                                 isQ2 ? 'bg-yellow-50 border-yellow-300'
+                                      : (needsTime?'bg-red-50 border-red-300':'bg-white')
+                               }`}
                                onClick={()=>setCalendarFocusId(t.id)}>
                             <div className="text-sm">{t.text}</div>
                             {t.scheduled?.datetime
                               ? <div className="text-xs text-slate-500 mt-1">Orario: {t.scheduled.datetime.replace('T',' ')}</div>
-                              : (!isLocked && <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>)}
-                            <div className="mt-2 flex gap-2 items-center">
+                              : (!isQ2 && <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>)}
+                            {isQ2 && <div className="text-[11px] text-amber-700 mt-1">Q2 Che</div>}
+                            <div className="mt-2 flex gap-2">
                               <input type="datetime-local"
-                                     className="rounded-lg border px-2 py-1 text-xs disabled:bg-slate-100 disabled:text-slate-400"
+                                     className="rounded-lg border px-2 py-1 text-xs"
                                      value={t.scheduled?.datetime || ''}
-                                     onChange={e=>setCalendarTime(t.id, e.target.value)}
-                                     disabled={isLocked}
-                              />
+                                     onChange={e=>setCalendarTime(t.id, e.target.value)} />
                               <button className="px-2 py-1 rounded-lg border text-xs bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700"
-                                      onClick={()=>markDone(t.id)}>
-                                Fatto ✓
-                              </button>
-                              {isLocked && <span className="text-[11px] text-amber-700">Non pianificabile</span>}
+                                      onClick={()=>markDone(t.id)}>Fatto ✓</button>
                             </div>
                           </div>
                         )
@@ -488,8 +500,6 @@
                       selectedId={calendarFocusId}
                       onPickSlot={(weekdayIndex, slotIndex)=>{
                         if (!calendarFocusId) return alert("Seleziona prima un'attività a sinistra.");
-                        const selected = state.tasks[calendarFocusId];
-                        if (selected?.column === LOCKED_COL) return alert("Le attività 'Q2 Che' non sono pianificabili.");
                         const dt = dateForCell(view.year, view.week, weekdayIndex, slotIndex);
                         setCalendarTime(calendarFocusId, dt);
                       }}
@@ -498,8 +508,8 @@
                 </div>
 
                 <div className="text-xs text-slate-500">
-                  Nota: “Fatto” rimuove l’attività sia da **SETTIMANA** sia da **CICLI ATTIVI**.
-                  Le attività “Q2 Che” restano in **CICLI ATTIVI** finché non vengono completate.
+                  Nota: “Fatto” rimuove l’attività sia da **SETTIMANA** sia da **CICLI ATTIVI**.  
+                  Se non svolta entro la settimana, la riproporrò nella successiva (le non Q2 Che in **rosso** finché non fissate).
                 </div>
               </section>
             )}
@@ -516,41 +526,15 @@
                   <label className="text-xs font-medium text-slate-600">Etichette colonne (una per riga)</label>
                   <EditableColumns
                     initial={state.settings.columns}
-                    lockedLabel={LOCKED_COL}
                     onApply={(cols)=>{ applyColumns(cols); setSettingsOpen(false); }}
                   />
                   <p className="text-xs text-slate-500">
-                    La colonna <b>{LOCKED_COL}</b> è obbligatoria e non può essere rimossa.
+                    “{SPECIAL_Q2}” resta sempre presente e non può essere eliminata.  
+                    Se rinomina/elimina altre colonne, le attività collegate verranno riassegnate alla prima colonna disponibile.
                   </p>
                 </div>
                 <div className="p-3 border-t flex justify-end">
                   <button className="px-3 py-2 rounded-xl border text-sm" onClick={()=>setSettingsOpen(false)}>Chiudi</button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Modale Note per backlog (Q2 Che) */}
-          {noteModal.open && (
-            <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={()=>setNoteModal({open:false,id:null,text:''})}>
-              <div className="w-full max-w-lg rounded-2xl bg-white shadow-xl" onClick={e=>e.stopPropagation()}>
-                <div className="p-4 border-b rounded-t-2xl">
-                  <div className="text-base font-semibold">Note attività</div>
-                </div>
-                <div className="p-4 space-y-2">
-                  <textarea rows="8" className="w-full rounded-xl border px-3 py-2 text-sm"
-                            value={noteModal.text}
-                            onChange={e=>setNoteModal(m=>({...m, text:e.target.value}))}></textarea>
-                </div>
-                <div className="p-3 border-t flex justify-end gap-2">
-                  <button className="px-3 py-2 rounded-xl border text-sm" onClick={()=>setNoteModal({open:false,id:null,text:''})}>Annulla</button>
-                  <button className="px-3 py-2 rounded-xl border text-sm bg-slate-900 text-white"
-                          onClick={()=>{
-                            if (noteModal.id) updateTask(noteModal.id, { note: noteModal.text });
-                            setNoteModal({open:false,id:null,text:''});
-                          }}>
-                    Salva
-                  </button>
                 </div>
               </div>
             </div>
@@ -644,13 +628,16 @@
                         .map(t=>{
                           const { top, height } = blockStyleFromDatetime(t.scheduled.datetime);
                           const selected = t.id === selectedId;
-                          const isLocked = t.column === "Q2 Che";
+                          const isQ2 = t.column === SPECIAL_Q2;
                           return (
                             <div key={t.id}
                                  className={`absolute left-1 right-1 rounded-md border px-2 py-1 text-xs overflow-hidden ${selected?'ring-2 ring-slate-900':''}`}
-                                 style={{ top, height,
-                                          background: isLocked ? '#FDE68A' : '#DBEAFE',
-                                          borderColor: isLocked ? '#F59E0B' : '#93C5FD' }}
+                                 style={{
+                                   top,
+                                   height,
+                                   background: isQ2 ? '#FEF9C3' : '#DBEAFE',   // giallo-100 : azzurro-100
+                                   borderColor: isQ2 ? '#FDE68A' : '#93C5FD'   // giallo-300 : azzurro-300
+                                 }}
                                  title={t.text}>
                               <div className="truncate">{t.text}</div>
                               <div className="opacity-70">{t.scheduled.datetime.slice(11)}</div>
@@ -665,7 +652,7 @@
       );
     }
 
-    function EditableColumns({ initial, lockedLabel, onApply }) {
+    function EditableColumns({ initial, onApply }) {
       const [value, setValue] = React.useState((initial || []).join('\n'));
       React.useEffect(()=> setValue((initial || []).join('\n')), [initial]);
 
@@ -681,10 +668,9 @@
             className="w-full rounded-xl border px-3 py-2 text-sm"
             value={value}
             onChange={e=>setValue(e.target.value)}
-            placeholder={'MANAGEMENT\nHR\nMARKETING\n...'}
+            placeholder={'Q2 Che\nMANAGEMENT\nHR\n...'}
           />
-          <div className="flex items-center justify-between">
-            <span className="text-[11px] text-slate-500">La colonna “{lockedLabel}” è obbligatoria e non può essere rimossa.</span>
+          <div className="flex justify-end gap-2">
             <button className="px-3 py-2 rounded-xl border text-sm" onClick={handleApply}>
               Applica
             </button>
