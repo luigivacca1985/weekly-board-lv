@@ -6,7 +6,7 @@
   <title>Weekly Board – LV</title>
   <!-- Tailwind (CDN) -->
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- React 18 UMD + Babel (per JSX inline, nessun build) -->
+  <!-- React 18 UMD + Babel (per JSX senza build) -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -15,13 +15,19 @@
   <div id="root"></div>
 
   <script type="text/babel">
-    const { useState, useEffect, useMemo } = React;
+    const { useState, useEffect, useMemo, useRef } = React;
 
-    // ======= Config =======
+    // ================== Config & Storage ==================
     const DEFAULT_COLUMNS = ["MANAGEMENT","HR","MARKETING","VENDITE","AMMINISTRAZIONE","PRODUZIONE","R&D","PERSONALE","DA DELEGARE"];
-    const STORAGE_KEY = "weekly_board_simple_v1";
+    const STORAGE_KEY = "weekly_board_v3"; // nuova versione con calendario visuale
 
-    // ======= Util date/ISO week =======
+    const nowISO = () => new Date().toISOString();
+    const uid = () => Math.random().toString(36).slice(2,10);
+
+    function load(){ try{ const raw = localStorage.getItem(STORAGE_KEY); if (raw) return JSON.parse(raw);}catch{} return null; }
+    function save(data){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }catch{} }
+
+    // ================== Week / Date utils (ISO) ==================
     function getISOWeek(date){
       const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
       const dayNum = d.getUTCDay() || 7;
@@ -36,7 +42,7 @@
       const ISOweekStart = new Date(simple);
       const diff = (dow <= 4 ? dow - 1 : dow - 8);
       ISOweekStart.setUTCDate(simple.getUTCDate() - diff);
-      return ISOweekStart; // UTC
+      return ISOweekStart; // UTC midnight
     }
     function weeksInYear(year){
       const d = new Date(Date.UTC(year, 11, 31));
@@ -54,360 +60,498 @@
       return `Settimana ${w} • ${fmt(s)} – ${fmt(e)}`;
     }
 
-    // ======= Storage =======
-    function load(){ try{ const raw = localStorage.getItem(STORAGE_KEY); if (raw) return JSON.parse(raw);}catch{} return null; }
-    function save(data){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }catch{} }
-    function deepClone(o){ return JSON.parse(JSON.stringify(o)); }
-
-    // ======= Data helpers =======
-    function ensureWeek(state, year, week){
-      if (!state.years[year]) state.years[year] = {};
-      if (!state.years[year][week]) {
-        state.years[year][week] = {};
-        state.settings.columns.forEach(c => state.years[year][week][c] = []);
-      } else {
-        // garantisce le nuove colonne anche nelle settimane vecchie
-        state.settings.columns.forEach(c => { if (!state.years[year][week][c]) state.years[year][week][c] = []; });
+    // ================== Data model ==================
+    /*
+      state = {
+        settings: { columns: string[] },
+        tasks: { [id]: Task },
+        lastRollover: {year, week} | null
       }
-      return state.years[year][week];
+      Task = {
+        id, text, note, column,
+        done: boolean,
+        createdAt: ISO,
+        scheduled?: { year:number, week:number, datetime?: string } // datetime = "YYYY-MM-DDTHH:mm" (locale)
+      }
+    */
+    function initialState(){
+      return {
+        settings: { columns: [...DEFAULT_COLUMNS] },
+        tasks: {},
+        lastRollover: null
+      };
     }
+    const deep = (o)=> JSON.parse(JSON.stringify(o));
 
-    // Sposta tutti i task NON completati dalle settimane passate alla settimana successiva, fino alla corrente
+    // ================== Rollover logic ==================
     function doRollover(state, targetYear, targetWeek){
-      const copy = deepClone(state);
-      const years = Object.keys(copy.years).map(n=>parseInt(n,10)).sort((a,b)=>a-b);
-      if (years.length === 0){ copy.lastRollover = {year: targetYear, week: targetWeek}; return copy; }
-
-      for (const y of years){
-        const maxW = weeksInYear(y);
-        for (let w=1; w<=maxW; w++){
-          if (y > targetYear || (y === targetYear && w >= targetWeek)) break;
-          const weekData = copy.years[y]?.[w];
-          if (!weekData) continue;
-          const cols = copy.settings.columns;
-          cols.forEach(col => {
-            const list = weekData[col] || [];
-            const undone = list.filter(t => !t.done);
-            if (undone.length === 0) return;
-            let y2 = y, w2 = w + 1;
-            const max2 = weeksInYear(y2);
-            if (w2 > max2) { y2 = y + 1; w2 = 1; }
-            const tgt = ensureWeek(copy, y2, w2);
-            tgt[col].push(...undone);
-            weekData[col] = list.filter(t => t.done);
-          });
+      const copy = deep(state);
+      const tasks = Object.values(copy.tasks);
+      for (const t of tasks){
+        if (t.done) continue;
+        if (!t.scheduled) continue;
+        const { year, week } = t.scheduled;
+        if (year < targetYear || (year === targetYear && week < targetWeek)){
+          // non svolta: riproposta settimana successiva
+          let y = year, w = week + 1;
+          const max = weeksInYear(y);
+          if (w > max) { y = y + 1; w = 1; }
+          t.scheduled.year = y;
+          t.scheduled.week = w;
+          // orario perso => da fissare
+          delete t.scheduled.datetime;
         }
       }
-      copy.lastRollover = {year: targetYear, week: targetWeek};
+      copy.lastRollover = { year: targetYear, week: targetWeek };
       return copy;
     }
 
-    // ======= ICS =======
-    function pad(n){ return String(n).padStart(2,'0'); }
-    function icsDate(date){
-      const y = date.getUTCFullYear(), m = pad(date.getUTCMonth()+1), d = pad(date.getUTCDate());
-      const hh = pad(date.getUTCHours()), mm = pad(date.getUTCMinutes()), ss = pad(date.getUTCSeconds());
-      return `${y}${m}${d}T${hh}${mm}${ss}Z`;
+    // ================== Helpers calendario ==================
+    const CAL_START_HOUR = 8;    // 08:00
+    const CAL_END_HOUR   = 20;   // 20:00 (escluso)
+    const SLOT_MINUTES   = 30;   // passo 30 minuti
+    const SLOTS_PER_HOUR = 60 / SLOT_MINUTES;
+    const TOTAL_ROWS = (CAL_END_HOUR - CAL_START_HOUR) * SLOTS_PER_HOUR;
+
+    function dateForCell(year, week, weekdayIndex, slotIndex){
+      // weekdayIndex: 0=Mon .. 6=Sun
+      const start = startOfISOWeek(year, week); // UTC
+      const d = new Date(start);
+      d.setUTCDate(start.getUTCDate() + weekdayIndex);
+      // Impostiamo ora/minuti locali
+      const local = new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), CAL_START_HOUR, 0, 0, 0);
+      const minutes = slotIndex * SLOT_MINUTES;
+      local.setMinutes(local.getMinutes() + minutes);
+      // Ritorna stringa per input datetime-local
+      const pad = n => String(n).padStart(2,'0');
+      const y = local.getFullYear();
+      const m = pad(local.getMonth()+1);
+      const day = pad(local.getDate());
+      const hh = pad(local.getHours());
+      const mm = pad(local.getMinutes());
+      return `${y}-${m}-${day}T${hh}:${mm}`;
     }
-    function escapeICS(t){ return (t||'').replace(/\\/g,'\\\\').replace(/\\n/g,'\\\\n').replace(/,/g,'\\\\,').replace(/;/g,'\\\\;'); }
+    function cellForDatetime(dtString){
+      // dtString formato "YYYY-MM-DDTHH:mm" (locale)
+      const dt = new Date(dtString);
+      const weekdayIndex = (dt.getDay()+6)%7; // 0=Mon..6=Sun
+      const minutesFromStart = (dt.getHours() - CAL_START_HOUR) * 60 + dt.getMinutes();
+      const slotIndex = Math.max(0, Math.min(TOTAL_ROWS-1, Math.round(minutesFromStart / SLOT_MINUTES)));
+      return { weekdayIndex, slotIndex };
+    }
+    function blockStyleFromDatetime(dtString){
+      const { slotIndex } = cellForDatetime(dtString);
+      const pxPerSlot = 24; // altezza visiva di uno slot (px)
+      const top = slotIndex * pxPerSlot;
+      const height = pxPerSlot; // 30' = 1 slot
+      return { top, height };
+    }
+    function weekdayLabel(year, week, weekdayIndex){
+      const s = startOfISOWeek(year, week);
+      const d = new Date(s); d.setUTCDate(s.getUTCDate()+weekdayIndex);
+      return d.toLocaleDateString('it-IT', { weekday:'short', day:'2-digit', month:'2-digit' });
+    }
 
-    // ======= App =======
+    // ================== App ==================
     function App(){
-      const { year:curYear, week:curWeek } = getISOWeek(new Date());
-      const [state, setState] = useState(()=> load() ?? ({ settings:{ columns:[...DEFAULT_COLUMNS] }, years:{}, lastRollover:null }));
+      const { year: curYear, week: curWeek } = getISOWeek(new Date());
+      const [state, setState] = useState(()=> load() ?? initialState());
+      const [route, setRoute] = useState(()=> (location.hash.replace('#','') || 'attivi'));
       const [view, setView] = useState({ year: curYear, week: curWeek });
-      const [settingsOpen, setSettingsOpen] = useState(false);
-      useEffect(()=> save(state), [state]);
+      const [calendarFocusId, setCalendarFocusId] = useState(null); // id task selezionato in calendario
 
-      // Rollover automatico all'ingresso in una nuova settimana
+      // Persistenza
+      useEffect(()=>{ save(state); }, [state]);
+      useEffect(()=>{ window.addEventListener('beforeunload', ()=>save(state)); }, []);
+
+      // Routing (hash)
+      useEffect(()=>{
+        const onHash = ()=> setRoute(location.hash.replace('#','') || 'attivi');
+        window.addEventListener('hashchange', onHash);
+        return ()=> window.removeEventListener('hashchange', onHash);
+      }, []);
+
+      // Rollover automatico all'apertura in nuova settimana
       useEffect(()=>{
         const t = getISOWeek(new Date());
-        if (isAfterWeek(t, state.lastRollover)){
+        if (isAfterWeek(t, state.lastRollover)) {
           setState(s => doRollover(s, t.year, t.week));
         }
-      }, []); // una volta al mount
+      }, []);
 
-      const weekData = useMemo(()=> ensureWeek(state, view.year, view.week), [state, view]);
-
-      function setColumns(cols){
-        setState(prev => ({ ...prev, settings: { ...prev.settings, columns: cols } }));
-      }
-      function addTask(col, text){
+      // Mutazioni
+      function addBacklog(text, column){
         if (!text.trim()) return;
-        setState(prev => {
-          const copy = deepClone(prev);
-          ensureWeek(copy, view.year, view.week)[col].unshift({ id: Math.random().toString(36).slice(2,10), text: text.trim(), note: '', done: false, createdAt: new Date().toISOString() });
+        setState(prev=>{
+          const copy = deep(prev);
+          const id = uid();
+          copy.tasks[id] = { id, text: text.trim(), note:'', column, done:false, createdAt: nowISO() };
           return copy;
         });
       }
-      function updateTask(col, id, patch){
-        setState(prev => {
-          const copy = deepClone(prev);
-          const list = ensureWeek(copy, view.year, view.week)[col];
-          const idx = list.findIndex(t=>t.id===id);
-          if (idx>=0) list[idx] = { ...list[idx], ...patch };
+      function updateTask(id, patch){
+        setState(prev=>{
+          const copy = deep(prev);
+          if (copy.tasks[id]) copy.tasks[id] = { ...copy.tasks[id], ...patch };
           return copy;
         });
       }
-      function deleteTask(col, id){
-        setState(prev => {
-          const copy = deepClone(prev);
-          const list = ensureWeek(copy, view.year, view.week)[col];
-          const idx = list.findIndex(t=>t.id===id);
-          if (idx>=0) list.splice(idx,1);
+      function removeTask(id){
+        setState(prev=>{
+          const copy = deep(prev);
+          delete copy.tasks[id];
+          return copy;
+        });
+      }
+      function assignToWeek(id, year, week){
+        setState(prev=>{
+          const copy = deep(prev);
+          const t = copy.tasks[id]; if (!t) return copy;
+          t.scheduled = { year, week }; // senza datetime => rosso (da fissare)
+          return copy;
+        });
+        location.hash = 'settimana';
+      }
+      function setCalendarTime(id, datetimeLocalValue){
+        setState(prev=>{
+          const copy = deep(prev);
+          const t = copy.tasks[id]; if (!t) return copy;
+          if (!t.scheduled) t.scheduled = { year: view.year, week: view.week };
+          t.scheduled.datetime = datetimeLocalValue;
+          return copy;
+        });
+      }
+      function markDone(id){
+        setState(prev=>{
+          const copy = deep(prev);
+          if (copy.tasks[id]) copy.tasks[id].done = true;
           return copy;
         });
       }
 
-      function prevWeek(){
-        let {year,week} = view;
-        if (week>1) week--; else { year--; week = weeksInYear(year); }
-        setView({year,week});
-      }
-      function nextWeek(){
-        let {year,week} = view;
-        const max = weeksInYear(year);
-        if (week<max) week++; else { year++; week = 1; }
-        setView({year,week});
-      }
+      // Filtri
+      const tasksArray = Object.values(state.tasks);
+      const backlogTasks = tasksArray.filter(t => !t.done && !t.scheduled); // CICLI ATTIVI
+      const weekTasks = tasksArray.filter(t => !t.done && t.scheduled && t.scheduled.year === view.year && t.scheduled.week === view.week);
+      const weekTasksOrdered = [...weekTasks].sort((a,b)=>{
+        const aHas = a.scheduled?.datetime ? 1 : 0;
+        const bHas = b.scheduled?.datetime ? 1 : 0;
+        if (aHas !== bHas) return aHas - bHas; // senza orario prima
+        return a.createdAt.localeCompare(b.createdAt);
+      });
 
-      function exportICS(){
-        const cols = state.settings.columns;
-        const data = ensureWeek(state, view.year, view.week);
-        const events = [];
-        const monday = startOfISOWeek(view.year, view.week);
-        const base = new Date(monday); base.setUTCHours(9,0,0,0);
-        let offset = 0;
-        cols.forEach(col => {
-          (data[col]||[]).forEach(task => {
-            const start = new Date(base.getTime() + offset*30*60*1000);
-            const end   = new Date(start.getTime() + 30*60*1000);
-            events.push({
-              uid: task.id,
-              summary: `[${col}] ${task.text}` + (task.done ? ' (completata)' : ''),
-              description: task.note || '',
-              dtstart: icsDate(start),
-              dtend: icsDate(end),
-            });
-            offset++;
-          });
-        });
-        const ics = `BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//LV-Associati//WeeklyBoard//IT
-CALSCALE:GREGORIAN
-METHOD:PUBLISH
-${events.map(e=>`BEGIN:VEVENT
-UID:${e.uid}@lv-associati
-SUMMARY:${escapeICS(e.summary)}
-DESCRIPTION:${escapeICS(e.description)}
-DTSTART:${e.dtstart}
-DTEND:${e.dtend}
-END:VEVENT`).join('\n')}
-END:VCALENDAR`;
-        const blob = new Blob([ics], { type: 'text/calendar;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url; a.download = `settimana_${view.year}_W${String(view.week).padStart(2,'0')}.ics`;
-        a.click(); URL.revokeObjectURL(url);
+      // UI commons
+      function WeekSelectors(){
+        return (
+          <div className="flex items-center gap-2">
+            <button className="px-2 py-2 rounded-xl border" onClick={()=>{
+              let {year, week} = view;
+              if (week>1) week -= 1; else { year -= 1; week = weeksInYear(year); }
+              setView({year,week});
+            }}>«</button>
+            <span className="inline-flex items-center rounded-full border px-2 py-1 text-sm bg-slate-100 text-slate-700">{fmtWeekLabel(view.year, view.week)}</span>
+            <button className="px-2 py-2 rounded-xl border" onClick={()=>{
+              let {year, week} = view;
+              const max = weeksInYear(year);
+              if (week<max) week += 1; else { year += 1; week = 1; }
+              setView({year,week});
+            }}>»</button>
+
+            <select className="ml-3 rounded-xl border px-3 py-2 text-sm" value={String(view.year)} onChange={e=>setView(p=>({...p, year: parseInt(e.target.value,10)}))}>
+              {Array.from({length:7}).map((_,i)=>{
+                const y = getISOWeek(new Date()).year - 3 + i;
+                return <option key={y} value={y}>{y}</option>
+              })}
+            </select>
+            <select className="rounded-xl border px-3 py-2 text-sm" value={String(view.week)} onChange={e=>setView(p=>({...p, week: parseInt(e.target.value,10)}))}>
+              {Array.from({length: weeksInYear(view.year)}).map((_,i)=>{
+                const w = i+1; return <option key={w} value={w}>W{String(w).padStart(2,'0')}</option>
+              })}
+            </select>
+          </div>
+        );
       }
 
-      const columns = state.settings.columns;
-
+      // ============ Render pages ============
       return (
         <div className="min-h-screen">
+          {/* Navbar */}
           <header className="sticky top-0 z-10 bg-white/80 backdrop-blur border-b">
             <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-3">
               <div className="shrink-0 w-9 h-9 rounded-2xl bg-slate-900 text-white grid place-content-center font-semibold">LV</div>
-              <div className="mr-auto">
-                <h1 className="text-lg font-semibold">Weekly Board – semplice</h1>
-                <p className="text-xs text-slate-500">Bacheca settimanale a colonne con rollover automatico ed export .ics.</p>
-              </div>
-              <button className="px-3 py-2 rounded-xl border text-sm" onClick={()=>setState(s=>doRollover(s, getISOWeek(new Date()).year, getISOWeek(new Date()).week))}>Esegui rollover</button>
-              <button className="px-3 py-2 rounded-xl border text-sm" onClick={exportICS}>Esporta .ics</button>
-              <button className="px-3 py-2 rounded-xl border text-sm" onClick={()=>setSettingsOpen(true)}>Impostazioni</button>
+              <nav className="mr-auto flex gap-1 text-sm">
+                <a href="#attivi" className={`px-3 py-2 rounded-xl border ${route==='attivi'?'bg-slate-900 text-white border-slate-900':''}`}>CICLI ATTIVI</a>
+                <a href="#settimana" className={`px-3 py-2 rounded-xl border ${route==='settimana'?'bg-slate-900 text-white border-slate-900':''}`}>SETTIMANA</a>
+                <a href="#calendario" className={`px-3 py-2 rounded-xl border ${route==='calendario'?'bg-slate-900 text-white border-slate-900':''}`}>CALENDARIO</a>
+              </nav>
+              <button className="px-3 py-2 rounded-xl border text-sm" onClick={()=>{
+                const t = getISOWeek(new Date());
+                setState(s => doRollover(s, t.year, t.week));
+              }}>Esegui rollover</button>
             </div>
           </header>
 
-          <main className="max-w-7xl mx-auto p-4">
-            <div className="mb-3 flex items-center gap-2">
-              <button className="px-2 py-2 rounded-xl border" onClick={prevWeek}>«</button>
-              <span className="inline-flex items-center rounded-full border px-2 py-1 text-sm bg-slate-100 text-slate-700">{fmtWeekLabel(view.year, view.week)}</span>
-              <button className="px-2 py-2 rounded-xl border" onClick={nextWeek}>»</button>
+          {/* Page content */}
+          <main className="max-w-7xl mx-auto p-4 space-y-6">
 
-              {/* Selettori anno/settimana */}
-              <select className="ml-3 rounded-xl border px-3 py-2 text-sm" value={String(view.year)} onChange={e=>setView(p=>({...p, year: parseInt(e.target.value,10)}))}>
-                {Array.from({length:7}).map((_,i)=> {
-                  const y = getISOWeek(new Date()).year - 3 + i;
-                  return <option key={y} value={y}>{y}</option>
-                })}
-              </select>
-              <select className="rounded-xl border px-3 py-2 text-sm" value={String(view.week)} onChange={e=>setView(p=>({...p, week: parseInt(e.target.value,10)}))}>
-                {Array.from({length: weeksInYear(view.year)}).map((_,i)=> {
-                  const w = i+1; return <option key={w} value={w}>W{String(w).padStart(2,'0')}</option>
-                })}
-              </select>
-            </div>
+            {/* CICLI ATTIVI */}
+            {route === 'attivi' && (
+              <section className="space-y-4">
+                <h2 className="text-lg font-semibold">CICLI ATTIVI (Backlog)</h2>
+                <AddBacklogForm columns={state.settings.columns} onAdd={addBacklog} />
 
-            <div className="grid md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-3">
-              {columns.map(col => (
-                <Column key={col}
-                        title={col}
-                        tasks={weekData[col]}
-                        onAdd={(t)=>addTask(col, t)}
-                        onToggle={(id,done)=>updateTask(col, id, {done})}
-                        onEdit={(id,patch)=>updateTask(col, id, patch)}
-                        onDelete={(id)=>deleteTask(col, id)} />
-              ))}
-            </div>
+                <div className="grid md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+                  {state.settings.columns.map(col=>{
+                    const items = backlogTasks.filter(t=>t.column===col);
+                    return (
+                      <div key={col} className="rounded-2xl border bg-white">
+                        <div className="p-3 border-b flex items-center justify-between">
+                          <div className="font-medium">{col}</div>
+                          <div className="text-xs text-slate-500">{items.length} attività</div>
+                        </div>
+                        <div className="p-3 space-y-2">
+                          {items.length===0 && <p className="text-xs text-slate-400">Nessuna attività.</p>}
+                          {items.map(t => (
+                            <div key={t.id} className="rounded-lg border p-2 bg-white">
+                              <div className="text-sm">{t.text}</div>
+                              {t.note && <div className="text-xs text-slate-500 mt-1 whitespace-pre-wrap">{t.note}</div>}
+                              <div className="mt-2 flex items-center gap-2">
+                                <AssignWeek onAssign={(y,w)=>assignToWeek(t.id,y,w)} />
+                                <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>removeTask(t.id)}>Elimina</button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </section>
+            )}
+
+            {/* SETTIMANA */}
+            {route === 'settimana' && (
+              <section className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-lg font-semibold">SETTIMANA</h2>
+                  <WeekSelectors />
+                </div>
+
+                <div className="grid md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-3">
+                  {state.settings.columns.map(col=>{
+                    const items = weekTasksOrdered.filter(t=>t.column===col);
+                    return (
+                      <div key={col} className="rounded-2xl border bg-white">
+                        <div className="p-3 border-b flex items-center justify-between">
+                          <div className="font-medium">{col}</div>
+                          <div className="text-xs text-slate-500">{items.length} attività</div>
+                        </div>
+                        <div className="p-3 space-y-2">
+                          {items.length===0 && <p className="text-xs text-slate-400">Nessuna attività.</p>}
+                          {items.map(t => {
+                            const needsTime = !(t.scheduled && t.scheduled.datetime);
+                            return (
+                              <div key={t.id} className={`rounded-lg border p-2 ${needsTime ? 'bg-red-50 border-red-300' : 'bg-white'}`}>
+                                <div className="flex items-start gap-2">
+                                  <input type="checkbox" className="mt-1" checked={!!t.done}
+                                    onChange={e=> e.target.checked ? markDone(t.id) : updateTask(t.id,{done:false})}
+                                    title={t.done?'Segna come non fatto':'Segna come fatto'} />
+                                  <div className="mr-auto">
+                                    <div className={`text-sm ${t.done?'line-through text-slate-400':''}`}>{t.text}</div>
+                                    {needsTime && <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>}
+                                    {t.scheduled?.datetime && <div className="text-xs text-slate-500 mt-1">Orario: {t.scheduled.datetime.replace('T',' ')}</div>}
+                                  </div>
+                                  <div className="flex gap-1">
+                                    <button className="px-2 py-1 rounded-lg border text-xs"
+                                      onClick={()=>{ setCalendarFocusId(t.id); location.hash='calendario'; }}>
+                                      Calendario
+                                    </button>
+                                    <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>updateTask(t.id,{scheduled:undefined})}>Rimuovi dalla settimana</button>
+                                  </div>
+                                </div>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </section>
+            )}
+
+            {/* CALENDARIO */}
+            {route === 'calendario' && (
+              <section className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-lg font-semibold">CALENDARIO</h2>
+                  <WeekSelectors />
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+                  {/* Pannello sinistro: elenco attività della settimana */}
+                  <div className="lg:col-span-1 rounded-2xl border bg-white">
+                    <div className="p-3 border-b">Attività della settimana</div>
+                    <div className="p-3 space-y-2">
+                      {weekTasksOrdered.length===0 && <p className="text-xs text-slate-400">Nessuna attività in settimana.</p>}
+                      {weekTasksOrdered.map(t=>{
+                        const selected = calendarFocusId === t.id;
+                        const needsTime = !(t.scheduled && t.scheduled.datetime);
+                        return (
+                          <div key={t.id}
+                               className={`rounded-lg border p-2 cursor-pointer ${selected ? 'ring-2 ring-slate-900' : ''} ${needsTime?'bg-red-50 border-red-300':'bg-white'}`}
+                               onClick={()=>setCalendarFocusId(t.id)}>
+                            <div className="text-sm">{t.text}</div>
+                            {t.scheduled?.datetime
+                              ? <div className="text-xs text-slate-500 mt-1">Orario: {t.scheduled.datetime.replace('T',' ')}</div>
+                              : <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>}
+                            <div className="mt-2 flex gap-2">
+                              <input type="datetime-local"
+                                     className="rounded-lg border px-2 py-1 text-xs"
+                                     value={t.scheduled?.datetime || ''}
+                                     onChange={e=>setCalendarTime(t.id, e.target.value)} />
+                              <button className="px-2 py-1 rounded-lg border text-xs bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700"
+                                      onClick={()=>markDone(t.id)}>Fatto ✓</button>
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Calendario settimanale */}
+                  <div className="lg:col-span-3 rounded-2xl border bg-white overflow-hidden">
+                    <CalendarGrid
+                      year={view.year}
+                      week={view.week}
+                      tasks={weekTasksOrdered}
+                      selectedId={calendarFocusId}
+                      onPickSlot={(weekdayIndex, slotIndex)=>{
+                        if (!calendarFocusId) return alert("Seleziona prima un'attività a sinistra.");
+                        const dt = dateForCell(view.year, view.week, weekdayIndex, slotIndex);
+                        setCalendarTime(calendarFocusId, dt);
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div className="text-xs text-slate-500">
+                  Nota: “Fatto” rimuove l’attività sia da **SETTIMANA** sia da **CICLI ATTIVI**.  
+                  Se non svolta entro la settimana, la riproporrò nella successiva in **rosso** finché non fisserà l’orario.
+                </div>
+              </section>
+            )}
           </main>
-
-          {settingsOpen && (
-            <Modal title="Impostazioni" onClose={()=>setSettingsOpen(false)}>
-              <div className="space-y-2">
-                <label className="text-xs font-medium text-slate-600">Etichette colonne (una per riga)</label>
-                <EditableColumns cols={columns} onChange={setColumns}/>
-              </div>
-            </Modal>
-          )}
         </div>
       );
     }
 
-    function Column({ title, tasks, onAdd, onToggle, onEdit, onDelete }){
+    // ================== Components ==================
+    function AddBacklogForm({ columns, onAdd }){
       const [text, setText] = useState('');
-      // Ordina: non fatte in alto, fatte in basso
-      const ordered = useMemo(()=> ([...(tasks||[])]).sort((a,b)=> Number(a.done) - Number(b.done)), [tasks]);
+      const [col, setCol] = useState(columns[0] || 'Altro');
+      useEffect(()=>{ if (!columns.includes(col) && columns.length) setCol(columns[0]) }, [columns]);
+      return (
+        <form className="rounded-2xl border bg-white p-3 flex flex-wrap gap-2 items-center"
+              onSubmit={e=>{ e.preventDefault(); onAdd(text, col); setText(''); }}>
+          <input className="flex-1 min-w-[260px] rounded-xl border px-3 py-2 text-sm" value={text} onChange={e=>setText(e.target.value)} placeholder="Nuova attività" />
+          <select className="rounded-xl border px-3 py-2 text-sm" value={col} onChange={e=>setCol(e.target.value)}>
+            {columns.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <button className="px-3 py-2 rounded-xl border text-sm">Aggiungi</button>
+        </form>
+      );
+    }
+
+    function AssignWeek({ onAssign }){
+      const { year: curYear, week: curWeek } = getISOWeek(new Date());
+      const [year, setYear] = useState(curYear);
+      const [week, setWeek] = useState(curWeek);
+      return (
+        <div className="flex items-center gap-1">
+          <select className="rounded-lg border px-2 py-1 text-xs" value={String(year)} onChange={e=>setYear(parseInt(e.target.value,10))}>
+            {Array.from({length:7}).map((_,i)=> {
+              const y = curYear - 3 + i; return <option key={y} value={y}>{y}</option>
+            })}
+          </select>
+          <select className="rounded-lg border px-2 py-1 text-xs" value={String(week)} onChange={e=>setWeek(parseInt(e.target.value,10))}>
+            {Array.from({length: weeksInYear(year)}).map((_,i)=> {
+              const w = i+1; return <option key={w} value={w}>W{String(w).padStart(2,'0')}</option>
+            })}
+          </select>
+          <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>onAssign(year, week)}>Assegna</button>
+        </div>
+      );
+    }
+
+    function CalendarGrid({ year, week, tasks, selectedId, onPickSlot }){
+      // Colonne: 7 giorni (lun-dom)
+      // Righe: slot da 30' (08:00-20:00)
+      const pxPerSlot = 24;
+      const hours = Array.from({length: CAL_END_HOUR - CAL_START_HOUR}, (_,i)=> CAL_START_HOUR + i);
+      const slots = Array.from({length: TOTAL_ROWS}, (_,i)=> i);
 
       return (
-        <div className="rounded-2xl border bg-white shadow-sm">
-          <div className="p-4 border-b rounded-t-2xl">
-            <div className="text-base font-semibold flex items-center justify-between">
-              <span>{title}</span>
-              <span className="text-xs font-normal text-slate-500">{(tasks||[]).length} attività</span>
-            </div>
+        <div className="w-full">
+          {/* Header giorni */}
+          <div className="grid" style={{ gridTemplateColumns: '80px repeat(7, 1fr)' }}>
+            <div className="bg-slate-100 border-b h-10 flex items-center justify-center text-xs text-slate-600">Ora</div>
+            {Array.from({length:7}, (_,d)=>(
+              <div key={d} className="bg-slate-100 border-b h-10 flex items-center justify-center text-sm font-medium">
+                {weekdayLabel(year, week, d)}
+              </div>
+            ))}
           </div>
-          <div className="p-4 space-y-3">
-            <form onSubmit={(e)=>{e.preventDefault(); onAdd(text); setText('');}} className="flex gap-2">
-              <input className="w-full rounded-xl border px-3 py-2 text-sm" value={text} onChange={e=>setText(e.target.value)} placeholder="Aggiungi attività" />
-              <button className="px-3 py-2 rounded-xl border text-sm">Aggiungi</button>
-            </form>
-            <div className="space-y-2">
-              {ordered.map(t => (
-                <TaskItem key={t.id} task={t}
-                  onToggle={(d)=>onToggle(t.id, d)}
-                  onEdit={(p)=>onEdit(t.id, p)}
-                  onDelete={()=>onDelete(t.id)} />
+
+          {/* Corpo: griglia oraria */}
+          <div className="relative">
+            <div className="grid" style={{ gridTemplateColumns: '80px repeat(7, 1fr)' }}>
+              {/* Colonna degli orari */}
+              <div className="border-r">
+                {hours.map(h=>(
+                  <div key={h} className="h-12 border-b text-[11px] text-slate-500 flex items-start justify-end pr-2">
+                    {String(h).padStart(2,'0')}:00
+                  </div>
+                ))}
+              </div>
+
+              {/* Le 7 colonne dei giorni */}
+              {Array.from({length:7}, (_,day)=>(
+                <div key={day} className="relative border-r" style={{ height: pxPerSlot*TOTAL_ROWS }}>
+                  {/* griglia slot cliccabili */}
+                  {slots.map(slot=>(
+                    <div key={slot}
+                         className={`border-b border-dashed ${slot%2===0?'bg-white':'bg-slate-50'}`}
+                         style={{ height: pxPerSlot }}
+                         onClick={()=>onPickSlot(day, slot)}
+                         title="Clicca per assegnare l'orario all'attività selezionata">
+                    </div>
+                  ))}
+
+                  {/* render tasks del giorno come blocchi posizionati */}
+                  {tasks.filter(t => t.scheduled?.datetime && (cellForDatetime(t.scheduled.datetime).weekdayIndex === day))
+                        .map(t=>{
+                          const { top, height } = blockStyleFromDatetime(t.scheduled.datetime);
+                          const selected = t.id === selectedId;
+                          return (
+                            <div key={t.id}
+                                 className={`absolute left-1 right-1 rounded-md border px-2 py-1 text-xs overflow-hidden ${selected?'ring-2 ring-slate-900':''}`}
+                                 style={{ top, height, background: '#DBEAFE', borderColor: '#93C5FD' }}
+                                 title={t.text}>
+                              <div className="truncate">{t.text}</div>
+                              <div className="opacity-70">{t.scheduled.datetime.slice(11)}</div>
+                            </div>
+                          );
+                        })}
+                </div>
               ))}
-              {(!tasks || tasks.length===0) && <p className="text-xs text-slate-400">Nessuna attività.</p>}
             </div>
           </div>
         </div>
       );
     }
 
-    function TaskItem({ task, onToggle, onEdit, onDelete }){
-      const [open, setOpen] = useState(false);
-      return (
-        <div className={`rounded-lg border p-2 ${task.done ? 'bg-emerald-50 border-emerald-200' : 'bg-white'}`}>
-          <div className="flex items-start gap-2">
-            {/* Checkbox classica */}
-            <input
-              type="checkbox"
-              className="mt-1"
-              checked={task.done}
-              onChange={e=>onToggle(e.target.checked)}
-              title={task.done ? "Segna come non fatto" : "Segna come fatto"}
-            />
-
-            {/* Titolo: doppio click = toggle */}
-            <div className="mr-auto">
-              <div
-                className={`text-sm ${task.done ? 'line-through text-slate-400':''} cursor-pointer`}
-                title="Doppio click per spuntare/annullare"
-                onDoubleClick={()=>onToggle(!task.done)}
-              >
-                {task.text}
-              </div>
-              {task.note && <div className="text-xs text-slate-500 whitespace-pre-wrap mt-1">{task.note}</div>}
-            </div>
-
-            {/* Azioni */}
-            <div className="flex gap-1">
-              {/* Pulsante spunta rapida */}
-              {!task.done ? (
-                <button
-                  className="px-2 py-1 rounded-lg border text-xs bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700"
-                  onClick={()=>onToggle(true)}
-                  title="Segna come fatto"
-                >
-                  Fatto ✓
-                </button>
-              ) : (
-                <button
-                  className="px-2 py-1 rounded-lg border text-xs"
-                  onClick={()=>onToggle(false)}
-                  title="Annulla spunta"
-                >
-                  Annulla ✓
-                </button>
-              )}
-
-              <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>setOpen(true)}>Dettagli</button>
-              <button className="px-2 py-1 rounded-lg border text-xs" onClick={onDelete}>Elimina</button>
-            </div>
-          </div>
-
-          {open && (
-            <Modal title="Dettagli attività" onClose={()=>setOpen(false)}>
-              <div className="space-y-2">
-                <label className="text-xs font-medium text-slate-600">Titolo</label>
-                <input className="w-full rounded-xl border px-3 py-2 text-sm"
-                       value={task.text} onChange={e=>onEdit({ text: e.target.value })} />
-                <label className="text-xs font-medium text-slate-600">Note</label>
-                <textarea rows="5" className="w-full rounded-xl border px-3 py-2 text-sm"
-                          value={task.note || ''} onChange={e=>onEdit({ note: e.target.value })}></textarea>
-              </div>
-            </Modal>
-          )}
-        </div>
-      );
-    }
-
-    function EditableColumns({ cols, onChange }){
-      const [value, setValue] = useState((cols||[]).join('\n'));
-      useEffect(()=> setValue((cols||[]).join('\n')), [cols]);
-      function apply(){
-        const lines = value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-        const unique = Array.from(new Set(lines));
-        onChange(unique);
-      }
-      return (
-        <div className="space-y-2">
-          <textarea rows="8" className="w-full rounded-xl border px-3 py-2 text-sm" value={value} onChange={e=>setValue(e.target.value)}></textarea>
-          <div className="flex justify-end">
-            <button className="px-3 py-2 rounded-xl border text-sm" onClick={apply}>Applica</button>
-          </div>
-        </div>
-      );
-    }
-
-    function Modal({ title, children, onClose }){
-      return (
-        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={onClose}>
-          <div className="w-full max-w-2xl rounded-2xl bg-white shadow-xl" onClick={e=>e.stopPropagation()}>
-            <div className="p-4 border-b rounded-t-2xl">
-              <div className="text-base font-semibold">{title}</div>
-            </div>
-            <div className="p-4">{children}</div>
-            <div className="p-3 border-t flex justify-end">
-              <button className="px-3 py-2 rounded-xl border text-sm" onClick={onClose}>Chiudi</button>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
+    // ================== Mount ==================
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>
