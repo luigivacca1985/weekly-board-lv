@@ -18,9 +18,9 @@
     const { useState, useEffect } = React;
 
     // ================== Config & Storage ==================
-    const SPECIAL_Q2 = "Q2 Che"; // colonna speciale
+    const SPECIAL_Q2 = "Q2";
     const DEFAULT_COLUMNS = [SPECIAL_Q2,"MANAGEMENT","HR","MARKETING","VENDITE","AMMINISTRAZIONE","PRODUZIONE","R&D","PERSONALE","DA DELEGARE"];
-    const STORAGE_KEY = "weekly_board_v3_q2che"; // storage versione con Q2 Che
+    const STORAGE_KEY = "weekly_board_v5"; // nuova versione con Q2 + appuntamenti studio
 
     const nowISO = () => new Date().toISOString();
     const uid = () => Math.random().toString(36).slice(2,10);
@@ -64,7 +64,7 @@
     // ================== Calendario helpers ==================
     const CAL_START_HOUR = 8;    // 08:00
     const CAL_END_HOUR   = 20;   // 20:00 (escluso)
-    const SLOT_MINUTES   = 30;   // 30'
+    const SLOT_MINUTES   = 30;   // passo 30 minuti
     const SLOTS_PER_HOUR = 60 / SLOT_MINUTES;
     const TOTAL_ROWS = (CAL_END_HOUR - CAL_START_HOUR) * SLOTS_PER_HOUR;
 
@@ -108,26 +108,31 @@
       state = {
         settings: { columns: string[] },
         tasks: { [id]: Task },
+        events: { [id]: StudyEvent }, // appuntamenti studio
         lastRollover: {year, week} | null
       }
       Task = {
         id, text, note, column,
         done: boolean,
         createdAt: ISO,
-        __showNotes?: boolean, // solo UI
         scheduled?: { year:number, week:number, datetime?: string } // "YYYY-MM-DDTHH:mm" (locale)
+        __showNotes?: boolean // UI only (backlog)
+      }
+      StudyEvent = {
+        id, title, note?, datetime: string // "YYYY-MM-DDTHH:mm"
       }
     */
     function initialState(){
       return {
         settings: { columns: [...DEFAULT_COLUMNS] },
         tasks: {},
+        events: {},
         lastRollover: null
       };
     }
     const deep = (o)=> JSON.parse(JSON.stringify(o));
 
-    // ================== Rollover logic ==================
+    // ================== Rollover logic (solo task) ==================
     function doRollover(state, targetYear, targetWeek){
       const copy = deep(state);
       const tasks = Object.values(copy.tasks);
@@ -145,6 +150,7 @@
           delete t.scheduled.datetime; // diventa "da fissare" (rosso)
         }
       }
+      // Gli appuntamenti studio NON fanno rollover automatico
       copy.lastRollover = { year: targetYear, week: targetWeek };
       return copy;
     }
@@ -154,17 +160,19 @@
       const { year: curYear, week: curWeek } = getISOWeek(new Date());
       const [state, setState] = useState(()=> {
         const loaded = load();
-        // garantisce che SPECIAL_Q2 esista e sia prima
-        if (loaded?.settings?.columns) {
-          const cols = loaded.settings.columns;
-          if (!cols.includes(SPECIAL_Q2)) loaded.settings.columns = [SPECIAL_Q2, ...cols];
-          else loaded.settings.columns = [SPECIAL_Q2, ...cols.filter(c=>c!==SPECIAL_Q2)];
+        // garantisce presenza e priorità di Q2 anche su storage vecchi
+        if (loaded && loaded.settings && Array.isArray(loaded.settings.columns)) {
+          let cols = loaded.settings.columns;
+          if (!cols.includes(SPECIAL_Q2)) cols = [SPECIAL_Q2, ...cols];
+          else cols = [SPECIAL_Q2, ...cols.filter(c=>c!==SPECIAL_Q2)];
+          loaded.settings.columns = cols;
         }
+        if (loaded && !loaded.events) loaded.events = {};
         return loaded ?? initialState();
       });
       const [route, setRoute] = useState(()=> (location.hash.replace('#','') || 'attivi'));
       const [view, setView] = useState({ year: curYear, week: curWeek });
-      const [calendarFocusId, setCalendarFocusId] = useState(null);
+      const [calendarFocusId, setCalendarFocusId] = useState(null); // task scelto per calendarizzare
       const [settingsOpen, setSettingsOpen] = useState(false);
 
       // Persistenza
@@ -186,7 +194,7 @@
         }
       }, []);
 
-      // Mutazioni
+      // ===== Mutazioni Task =====
       function addBacklog(text, column){
         if (!text.trim()) return;
         setState(prev=>{
@@ -236,7 +244,32 @@
         });
       }
 
-      // Colonne modificabili (ma Q2 Che sempre presente e prima)
+      // ===== Mutazioni Appuntamenti Studio =====
+      function addStudy(title, dt){
+        if (!title.trim() || !dt) return;
+        setState(prev=>{
+          const copy = deep(prev);
+          const id = uid();
+          copy.events[id] = { id, title: title.trim(), datetime: dt };
+          return copy;
+        });
+      }
+      function updateStudy(id, patch){
+        setState(prev=>{
+          const copy = deep(prev);
+          if (copy.events[id]) copy.events[id] = { ...copy.events[id], ...patch };
+          return copy;
+        });
+      }
+      function removeStudy(id){
+        setState(prev=>{
+          const copy = deep(prev);
+          delete copy.events[id];
+          return copy;
+        });
+      }
+
+      // Colonne modificabili, Q2 sempre presente e prima
       function applyColumns(newCols) {
         const cols = newCols.map(s => s.trim()).filter(Boolean);
         let unique = Array.from(new Set(cols));
@@ -256,23 +289,27 @@
         });
       }
 
-      // Filtri
+      // ===== Selettori =====
       const tasksArray = Object.values(state.tasks);
-
-      // CICLI ATTIVI: Q2 Che resta visibile anche se scheduled
+      // Q2 resta nel backlog anche se programmata (finché non è "Fatto")
       const backlogTasks = tasksArray.filter(t =>
         !t.done && (t.column === SPECIAL_Q2 || !t.scheduled)
       );
 
-      const weekTasks = tasksArray.filter(t =>
-        !t.done && t.scheduled && t.scheduled.year === view.year && t.scheduled.week === view.week
-      );
-
+      const weekTasks = tasksArray.filter(t => !t.done && t.scheduled && t.scheduled.year === view.year && t.scheduled.week === view.week);
       const weekTasksOrdered = [...weekTasks].sort((a,b)=>{
         const aHas = a.scheduled?.datetime ? 1 : 0;
         const bHas = b.scheduled?.datetime ? 1 : 0;
         if (aHas !== bHas) return aHas - bHas; // senza orario (rossi) prima
         return a.createdAt.localeCompare(b.createdAt);
+      });
+
+      // Appuntamenti studio nella settimana di vista
+      const studyEvents = Object.values(state.events || {});
+      const studyEventsWeek = studyEvents.filter(ev => {
+        if (!ev.datetime) return false;
+        const { year, week } = getISOWeek(new Date(ev.datetime));
+        return year === view.year && week === view.week;
       });
 
       // UI commons
@@ -352,15 +389,20 @@
                         <div className="p-3 space-y-2">
                           {items.length===0 && <p className="text-xs text-slate-400">Nessuna attività.</p>}
                           {items.map(t => (
-                            <div key={t.id} className="rounded-lg border p-2 bg-white">
+                            <div key={t.id} className={`rounded-lg border p-2 ${t.column===SPECIAL_Q2 ? 'bg-yellow-50 border-yellow-300' : 'bg-white'}`}>
                               <div className="text-sm">{t.text}</div>
                               {t.note && <div className="text-xs text-slate-500 mt-1 whitespace-pre-wrap">{t.note}</div>}
                               <div className="mt-2 flex items-center gap-2">
                                 <AssignWeek onAssign={(y,w)=>assignToWeek(t.id,y,w)} />
+
+                                {/* Bottone Note */}
                                 <button
                                   className="px-2 py-1 rounded-lg border text-xs"
                                   onClick={() => updateTask(t.id, { __showNotes: !t.__showNotes })}
-                                >Note</button>
+                                >
+                                  Note
+                                </button>
+
                                 <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>removeTask(t.id)}>Elimina</button>
                               </div>
 
@@ -409,18 +451,17 @@
                             const needsTime = !(t.scheduled && t.scheduled.datetime);
                             const isQ2 = t.column === SPECIAL_Q2;
                             return (
-                              <div key={t.id}
-                                   className={`rounded-lg border p-2 ${
-                                     isQ2 ? 'bg-yellow-50 border-yellow-300'
-                                          : (needsTime ? 'bg-red-50 border-red-300' : 'bg-white')
-                                   }`}>
+                              <div key={t.id} className={`rounded-lg border p-2 ${
+                                isQ2 ? 'bg-yellow-50 border-yellow-300'
+                                     : (needsTime ? 'bg-red-50 border-red-300' : 'bg-white')
+                              }`}>
                                 <div className="flex items-start gap-2">
                                   <input type="checkbox" className="mt-1" checked={!!t.done}
                                     onChange={e=> e.target.checked ? markDone(t.id) : updateTask(t.id,{done:false})}
                                     title={t.done?'Segna come non fatto':'Segna come fatto'} />
                                   <div className="mr-auto">
                                     <div className={`text-sm ${t.done?'line-through text-slate-400':''}`}>{t.text}</div>
-                                    {isQ2 && <div className="text-[11px] text-amber-700 mt-1">Q2 Che</div>}
+                                    {isQ2 && <div className="text-[11px] text-amber-700 mt-1">Q2</div>}
                                     {!isQ2 && needsTime && <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>}
                                     {t.scheduled?.datetime && <div className="text-xs text-slate-500 mt-1">Orario: {t.scheduled.datetime.replace('T',' ')}</div>}
                                   </div>
@@ -455,39 +496,65 @@
                   <WeekSelectors />
                 </div>
 
-                <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-                  {/* Elenco attività settimana */}
-                  <div className="lg:col-span-1 rounded-2xl border bg-white">
-                    <div className="p-3 border-b">Attività della settimana</div>
-                    <div className="p-3 space-y-2">
-                      {weekTasksOrdered.length===0 && <p className="text-xs text-slate-400">Nessuna attività in settimana.</p>}
-                      {weekTasksOrdered.map(t=>{
-                        const selected = calendarFocusId === t.id;
-                        const needsTime = !(t.scheduled && t.scheduled.datetime);
-                        const isQ2 = t.column === SPECIAL_Q2;
-                        return (
-                          <div key={t.id}
-                               className={`rounded-lg border p-2 cursor-pointer ${selected ? 'ring-2 ring-slate-900' : ''} ${
-                                 isQ2 ? 'bg-yellow-50 border-yellow-300'
-                                      : (needsTime?'bg-red-50 border-red-300':'bg-white')
-                               }`}
-                               onClick={()=>setCalendarFocusId(t.id)}>
-                            <div className="text-sm">{t.text}</div>
-                            {t.scheduled?.datetime
-                              ? <div className="text-xs text-slate-500 mt-1">Orario: {t.scheduled.datetime.replace('T',' ')}</div>
-                              : (!isQ2 && <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>)}
-                            {isQ2 && <div className="text-[11px] text-amber-700 mt-1">Q2 Che</div>}
-                            <div className="mt-2 flex gap-2">
-                              <input type="datetime-local"
-                                     className="rounded-lg border px-2 py-1 text-xs"
-                                     value={t.scheduled?.datetime || ''}
-                                     onChange={e=>setCalendarTime(t.id, e.target.value)} />
-                              <button className="px-2 py-1 rounded-lg border text-xs bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700"
-                                      onClick={()=>markDone(t.id)}>Fatto ✓</button>
+                <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
+                  {/* Colonna sinistra: Attività settimana */}
+                  <div className="lg:col-span-2 space-y-4">
+                    <div className="rounded-2xl border bg-white">
+                      <div className="p-3 border-b">Attività della settimana</div>
+                      <div className="p-3 space-y-2">
+                        {weekTasksOrdered.length===0 && <p className="text-xs text-slate-400">Nessuna attività in settimana.</p>}
+                        {weekTasksOrdered.map(t=>{
+                          const selected = calendarFocusId === t.id;
+                          const needsTime = !(t.scheduled && t.scheduled.datetime);
+                          const isQ2 = t.column === SPECIAL_Q2;
+                          return (
+                            <div key={t.id}
+                                 className={`rounded-lg border p-2 cursor-pointer ${selected ? 'ring-2 ring-slate-900' : ''} ${
+                                   isQ2 ? 'bg-yellow-50 border-yellow-300'
+                                        : (needsTime?'bg-red-50 border-red-300':'bg-white')
+                                 }`}
+                                 onClick={()=>setCalendarFocusId(t.id)}>
+                              <div className="text-sm">{t.text}</div>
+                              {isQ2 && <div className="text-[11px] text-amber-700 mt-1">Q2</div>}
+                              {t.scheduled?.datetime
+                                ? <div className="text-xs text-slate-500 mt-1">Orario: {t.scheduled.datetime.replace('T',' ')}</div>
+                                : (!isQ2 && <div className="text-[11px] text-red-700 mt-1">Calendario da fissare</div>)}
+                              <div className="mt-2 flex gap-2">
+                                <input type="datetime-local"
+                                       className="rounded-lg border px-2 py-1 text-xs"
+                                       value={t.scheduled?.datetime || ''}
+                                       onChange={e=>setCalendarTime(t.id, e.target.value)} />
+                                <button className="px-2 py-1 rounded-lg border text-xs bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700"
+                                        onClick={()=>markDone(t.id)}>Fatto ✓</button>
+                              </div>
                             </div>
-                          </div>
-                        )
-                      })}
+                          )
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Appuntamenti Studio */}
+                    <div className="rounded-2xl border bg-white">
+                      <div className="p-3 border-b">Appuntamenti Studio</div>
+                      <div className="p-3 space-y-3">
+                        <StudyForm onAdd={(title,dt)=>addStudy(title,dt)} />
+                        <div className="space-y-2">
+                          {studyEventsWeek.length===0 && <p className="text-xs text-slate-400">Nessun appuntamento studio in settimana.</p>}
+                          {studyEventsWeek.map(ev=>(
+                            <div key={ev.id} className="rounded-lg border p-2" style={{ background:'#F5F3FF', borderColor:'#C4B5FD' }}>
+                              <div className="text-sm">{ev.title}</div>
+                              <div className="text-xs text-slate-600 mt-1">Orario: {ev.datetime.replace('T',' ')}</div>
+                              <div className="mt-2 flex flex-wrap items-center gap-2">
+                                <input type="datetime-local"
+                                       className="rounded-lg border px-2 py-1 text-xs"
+                                       value={ev.datetime}
+                                       onChange={e=>updateStudy(ev.id,{ datetime: e.target.value })} />
+                                <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>removeStudy(ev.id)}>Elimina</button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
                     </div>
                   </div>
 
@@ -497,19 +564,30 @@
                       year={view.year}
                       week={view.week}
                       tasks={weekTasksOrdered}
+                      study={studyEventsWeek}
                       selectedId={calendarFocusId}
                       onPickSlot={(weekdayIndex, slotIndex)=>{
-                        if (!calendarFocusId) return alert("Seleziona prima un'attività a sinistra.");
-                        const dt = dateForCell(view.year, view.week, weekdayIndex, slotIndex);
-                        setCalendarTime(calendarFocusId, dt);
+                        if (calendarFocusId) {
+                          const dt = dateForCell(view.year, view.week, weekdayIndex, slotIndex);
+                          setCalendarTime(calendarFocusId, dt);
+                        } else {
+                          // Se non c'è un'attività selezionata, guidiamo l'utente a creare un appuntamento studio veloce
+                          const title = prompt("Nessuna attività selezionata. Inserisci titolo per un Appuntamento Studio:");
+                          if (title) {
+                            const dt = dateForCell(view.year, view.week, weekdayIndex, slotIndex);
+                            addStudy(title, dt);
+                          }
+                        }
                       }}
                     />
                   </div>
                 </div>
 
                 <div className="text-xs text-slate-500">
-                  Nota: “Fatto” rimuove l’attività sia da **SETTIMANA** sia da **CICLI ATTIVI**.  
-                  Se non svolta entro la settimana, la riproporrò nella successiva (le non Q2 Che in **rosso** finché non fissate).
+                  Nota: “Fatto” rimuove l’attività sia da <b>SETTIMANA</b> sia da <b>CICLI ATTIVI</b>.  
+                  Se non svolta entro la settimana, la riproporrò nella successiva in <span class="text-red-700">rosso</span> (orario da fissare).  
+                  Le attività <b>Q2</b> sono evidenziate in <span class="text-amber-700">giallo</span> e non si possono rimuovere dalla settimana.  
+                  Gli <b>Appuntamenti Studio</b> sono indipendenti dai task e compaiono in <span class="text-violet-700">viola</span>.
                 </div>
               </section>
             )}
@@ -529,8 +607,8 @@
                     onApply={(cols)=>{ applyColumns(cols); setSettingsOpen(false); }}
                   />
                   <p className="text-xs text-slate-500">
-                    “{SPECIAL_Q2}” resta sempre presente e non può essere eliminata.  
-                    Se rinomina/elimina altre colonne, le attività collegate verranno riassegnate alla prima colonna disponibile.
+                    <b>{SPECIAL_Q2}</b> è obbligatoria e resta sempre in prima posizione.
+                    Le attività con colonna eliminata verranno riassegnate alla prima colonna disponibile.
                   </p>
                 </div>
                 <div className="p-3 border-t flex justify-end">
@@ -581,7 +659,26 @@
       );
     }
 
-    function CalendarGrid({ year, week, tasks, selectedId, onPickSlot }){
+    function StudyForm({ onAdd }){
+      const [title, setTitle] = useState('');
+      const [dt, setDt] = useState('');
+      return (
+        <form className="flex flex-wrap items-center gap-2"
+              onSubmit={e=>{ e.preventDefault(); onAdd(title, dt); setTitle(''); setDt(''); }}>
+          <input className="flex-1 min-w-[220px] rounded-lg border px-2 py-1 text-sm"
+                 placeholder="Titolo appuntamento studio"
+                 value={title}
+                 onChange={e=>setTitle(e.target.value)} />
+          <input type="datetime-local"
+                 className="rounded-lg border px-2 py-1 text-sm"
+                 value={dt}
+                 onChange={e=>setDt(e.target.value)} />
+          <button className="px-3 py-2 rounded-lg border text-sm">Aggiungi</button>
+        </form>
+      );
+    }
+
+    function CalendarGrid({ year, week, tasks, study, selectedId, onPickSlot }){
       const pxPerSlot = 24;
       const hours = Array.from({length: CAL_END_HOUR - CAL_START_HOUR}, (_,i)=> CAL_START_HOUR + i);
       const slots = Array.from({length: TOTAL_ROWS}, (_,i)=> i);
@@ -619,7 +716,7 @@
                          className={`border-b border-dashed ${slot%2===0?'bg-white':'bg-slate-50'}`}
                          style={{ height: pxPerSlot }}
                          onClick={()=>onPickSlot(day, slot)}
-                         title="Clicca per assegnare l'orario all'attività selezionata">
+                         title="Clicca per assegnare l'orario (task selezionato) o creare un appuntamento studio">
                     </div>
                   ))}
 
@@ -641,6 +738,26 @@
                                  title={t.text}>
                               <div className="truncate">{t.text}</div>
                               <div className="opacity-70">{t.scheduled.datetime.slice(11)}</div>
+                            </div>
+                          );
+                        })}
+
+                  {/* blocchi appuntamenti studio */}
+                  {study.filter(ev => cellForDatetime(ev.datetime).weekdayIndex === day)
+                        .map(ev=>{
+                          const { top, height } = blockStyleFromDatetime(ev.datetime);
+                          return (
+                            <div key={ev.id}
+                                 className="absolute left-1 right-1 rounded-md border px-2 py-1 text-xs overflow-hidden"
+                                 style={{
+                                   top,
+                                   height,
+                                   background: '#F5F3FF',   // violet-100
+                                   borderColor: '#C4B5FD'   // violet-300
+                                 }}
+                                 title={ev.title}>
+                              <div className="truncate">Studio: {ev.title}</div>
+                              <div className="opacity-70">{ev.datetime.slice(11)}</div>
                             </div>
                           );
                         })}
@@ -668,7 +785,7 @@
             className="w-full rounded-xl border px-3 py-2 text-sm"
             value={value}
             onChange={e=>setValue(e.target.value)}
-            placeholder={'Q2 Che\nMANAGEMENT\nHR\n...'}
+            placeholder={'Q2\nMANAGEMENT\nHR\nMARKETING\n...'}
           />
           <div className="flex justify-end gap-2">
             <button className="px-3 py-2 rounded-xl border text-sm" onClick={handleApply}>
