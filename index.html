@@ -20,13 +20,87 @@
     // ================== Config & Storage ==================
     const SPECIAL_Q2 = "Q2";
     const DEFAULT_COLUMNS = [SPECIAL_Q2,"MANAGEMENT","HR","MARKETING","VENDITE","AMMINISTRAZIONE","PRODUZIONE","R&D","PERSONALE","DA DELEGARE"];
-    const STORAGE_KEY = "weekly_board_v6"; // manteniamo la stessa chiave per non perdere i dati
+    const STORAGE_KEY = "weekly_board_v6"; // NON cambiare questa chiave
+
+    // Endpoint Apps Script su Google Drive (già configurato con il Suo URL)
+    const DRIVE_ENDPOINT = "https://script.google.com/macros/s/AKfycbxCoZaPtNLJEZv_d-B_bY9L4CnuUAegsb0mG3Fo7aVCfAJ5_otIGSx04LFt8iLk90gN/exec";
 
     const nowISO = () => new Date().toISOString();
     const uid = () => Math.random().toString(36).slice(2,10);
 
-    function load(){ try{ const raw = localStorage.getItem(STORAGE_KEY); if (raw) return JSON.parse(raw);}catch{} return null; }
-    function save(data){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }catch{} }
+    function load(){
+      try{
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw) return JSON.parse(raw);
+      }catch{}
+      return null;
+    }
+    function save(data){
+      try{
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      }catch{}
+    }
+
+    // Sincronizzazione con Apps Script (Drive)
+    async function cloudLoad(){
+      try {
+        if (!DRIVE_ENDPOINT) return null;
+        const res = await fetch(DRIVE_ENDPOINT, { method: "GET" });
+        if (!res.ok) return null;
+        const text = await res.text();
+        if (!text) return null;
+        return JSON.parse(text);
+      } catch (e) {
+        console.error("cloudLoad error", e);
+        return null;
+      }
+    }
+
+    async function cloudSave(data){
+      try {
+        if (!DRIVE_ENDPOINT) return;
+        await fetch(DRIVE_ENDPOINT, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data)
+        });
+      } catch (e) {
+        console.error("cloudSave error", e);
+      }
+    }
+
+    // Normalizzazione stato (per vecchie versioni o import da file)
+    function normalizeState(input){
+      const deep = o => JSON.parse(JSON.stringify(o || {}));
+      let data = deep(input || {});
+      if (!data.settings) data.settings = {};
+      if (!Array.isArray(data.settings.columns) || data.settings.columns.length === 0){
+        data.settings.columns = [...DEFAULT_COLUMNS];
+      }
+      // garantisce Q2 presente ed in prima posizione
+      let cols = data.settings.columns;
+      if (!cols.includes(SPECIAL_Q2)) cols = [SPECIAL_Q2, ...cols];
+      else cols = [SPECIAL_Q2, ...cols.filter(c=>c!==SPECIAL_Q2)];
+      data.settings.columns = cols;
+
+      if (!data.tasks) data.tasks = {};
+      if (!data.events) data.events = {};
+
+      // assicura note sugli eventi
+      for (const ev of Object.values(data.events)) {
+        if (ev.note === undefined) ev.note = "";
+      }
+      // assicura campi minimi sui task
+      for (const t of Object.values(data.tasks)) {
+        if (!t.createdAt) t.createdAt = nowISO();
+        if (t.done === undefined) t.done = false;
+        if (!t.column) t.column = SPECIAL_Q2;
+        if (!cols.includes(t.column)) t.column = cols[0];
+        if (t.note === undefined) t.note = "";
+      }
+
+      return data;
+    }
 
     // ================== Week / Date utils (ISO) ==================
     function getISOWeek(date){
@@ -132,11 +206,11 @@
         id, text, note, column,
         done: boolean,
         createdAt: ISO,
-        scheduled?: { year:number, week:number, datetime?: string } // "YYYY-MM-DDTHH:mm" (locale)
-        __showNotes?: boolean // UI only (backlog)
+        scheduled?: { year:number, week:number, datetime?: string }
+        __showNotes?: boolean
       }
       StudyEvent = {
-        id, title, note, datetime: string // "YYYY-MM-DDTHH:mm", durata fissa 60'
+        id, title, note, datetime: string // "YYYY-MM-DDTHH:mm"
       }
     */
     function initialState(){
@@ -167,7 +241,6 @@
           delete t.scheduled.datetime; // diventa "da fissare" (rosso)
         }
       }
-      // Gli appuntamenti studio NON fanno rollover automatico
       copy.lastRollover = { year: targetYear, week: targetWeek };
       return copy;
     }
@@ -175,32 +248,39 @@
     // ================== App ==================
     function App(){
       const { year: curYear, week: curWeek } = getISOWeek(new Date());
-      const [state, setState] = useState(()=> {
+      const [state, setState] = useState(()=>{
         const loaded = load();
-        // garantisce presenza e priorità di Q2 anche su storage vecchi
-        if (loaded && loaded.settings && Array.isArray(loaded.settings.columns)) {
-          let cols = loaded.settings.columns;
-          if (!cols.includes(SPECIAL_Q2)) cols = [SPECIAL_Q2, ...cols];
-          else cols = [SPECIAL_Q2, ...cols.filter(c=>c!==SPECIAL_Q2)];
-          loaded.settings.columns = cols;
-        }
-        if (loaded && !loaded.events) loaded.events = {};
-        // assicura presenza "note" sugli eventi esistenti
-        if (loaded && loaded.events) {
-          for (const ev of Object.values(loaded.events)) {
-            if (ev.note === undefined) ev.note = "";
-          }
-        }
-        return loaded ?? initialState();
+        return normalizeState(loaded ?? initialState());
       });
       const [route, setRoute] = useState(()=> (location.hash.replace('#','') || 'attivi'));
       const [view, setView] = useState({ year: curYear, week: curWeek });
-      const [calendarFocusId, setCalendarFocusId] = useState(null); // task scelto per calendarizzare
+      const [calendarFocusId, setCalendarFocusId] = useState(null);
       const [settingsOpen, setSettingsOpen] = useState(false);
+      const [lastSavedAt, setLastSavedAt] = useState(null);
+      const [cloudStatus, setCloudStatus] = useState(null); // 'ok' | 'error' | null
 
-      // Persistenza
-      useEffect(()=>{ save(state); }, [state]);
-      useEffect(()=>{ window.addEventListener('beforeunload', ()=>save(state)); }, []);
+      // Caricamento iniziale da Drive (se disponibile)
+      useEffect(()=>{
+        (async () => {
+          const remote = await cloudLoad();
+          if (remote && Object.keys(remote).length) {
+            setState(normalizeState(remote));
+          }
+        })();
+      }, []);
+
+      // Persistenza su localStorage + sync su Drive
+      useEffect(()=>{
+        save(state);
+        setLastSavedAt(new Date());
+        cloudSave(state)
+          .then(()=>setCloudStatus('ok'))
+          .catch(()=>setCloudStatus('error'));
+      }, [state]);
+
+      useEffect(()=>{
+        window.addEventListener('beforeunload', ()=>save(state));
+      }, []);
 
       // Routing (hash)
       useEffect(()=>{
@@ -245,7 +325,7 @@
         setState(prev=>{
           const copy = deep(prev);
           const t = copy.tasks[id]; if (!t) return copy;
-          t.scheduled = { year, week }; // senza datetime => rosso
+          t.scheduled = { year, week };
           return copy;
         });
         location.hash = 'settimana';
@@ -292,6 +372,47 @@
         });
       }
 
+      // ===== Export / Import locale (backup manuale) =====
+      function exportData(){
+        try{
+          const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "lv-weekly-board-backup.json";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          alert("Dati esportati. Può salvare il file anche su Drive.");
+        }catch(e){
+          alert("Errore durante l'esportazione dati.");
+        }
+      }
+
+      function importData(){
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = "application/json";
+        input.onchange = (e)=>{
+          const file = e.target.files[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = (ev)=>{
+            try{
+              const parsed = JSON.parse(ev.target.result);
+              const normalized = normalizeState(parsed);
+              setState(normalized);
+              alert("Dati importati correttamente.");
+            }catch(err){
+              alert("File non valido. Assicurarsi che sia il backup esportato dall'app.");
+            }
+          };
+          reader.readAsText(file);
+        };
+        input.click();
+      }
+
       // Colonne modificabili, Q2 sempre presente e prima
       function applyColumns(newCols) {
         const cols = newCols.map(s => s.trim()).filter(Boolean);
@@ -303,7 +424,6 @@
           const copy = deep(prev);
           const prevFirst = copy.settings.columns[0] || unique[0];
           copy.settings.columns = unique;
-          // riassegna le attività con colonna non più presente
           const fallback = unique[0] || prevFirst;
           for (const t of Object.values(copy.tasks)) {
             if (!unique.includes(t.column)) t.column = fallback;
@@ -314,7 +434,6 @@
 
       // ===== Selettori =====
       const tasksArray = Object.values(state.tasks);
-      // Q2 resta nel backlog anche se programmata (finché non è "Fatto")
       const backlogTasks = tasksArray.filter(t =>
         !t.done && (t.column === SPECIAL_Q2 || !t.scheduled)
       );
@@ -323,11 +442,10 @@
       const weekTasksOrdered = [...weekTasks].sort((a,b)=>{
         const aHas = a.scheduled?.datetime ? 1 : 0;
         const bHas = b.scheduled?.datetime ? 1 : 0;
-        if (aHas !== bHas) return aHas - bHas; // senza orario (rossi) prima
+        if (aHas !== bHas) return aHas - bHas;
         return a.createdAt.localeCompare(b.createdAt);
       });
 
-      // Appuntamenti studio nella settimana di vista (durata fissa 60')
       const studyEvents = Object.values(state.events || {});
       const studyEventsWeek = studyEvents.filter(ev => {
         if (!ev.datetime) return false;
@@ -367,6 +485,15 @@
         );
       }
 
+      const savedLabel = lastSavedAt
+        ? lastSavedAt.toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'})
+        : '—';
+
+      const cloudLabel =
+        !DRIVE_ENDPOINT
+          ? "Drive non configurato"
+          : (cloudStatus === 'ok' ? "Sync Drive OK" : (cloudStatus === 'error' ? "Errore Drive" : "Sync Drive…"));
+
       // ============ Render ============
       return (
         <div className="min-h-screen">
@@ -379,6 +506,17 @@
                 <a href="#settimana" className={`px-3 py-2 rounded-xl border ${route==='settimana'?'bg-slate-900 text-white border-slate-900':''}`}>SETTIMANA</a>
                 <a href="#calendario" className={`px-3 py-2 rounded-xl border ${route==='calendario'?'bg-slate-900 text-white border-slate-900':''}`}>CALENDARIO</a>
               </nav>
+
+              <div className="hidden md:flex flex-col items-end text-[11px] text-slate-500 mr-2">
+                <span>Salvato alle <b>{savedLabel}</b></span>
+                <span className={cloudStatus === 'ok' ? "text-emerald-600" : (cloudStatus === 'error' ? "text-red-600" : "text-slate-500")}>
+                  {cloudLabel}
+                </span>
+              </div>
+
+              <button className="px-3 py-2 rounded-xl border text-xs md:text-sm" onClick={exportData}>Esporta dati</button>
+              <button className="px-3 py-2 rounded-xl border text-xs md:text-sm" onClick={importData}>Importa dati</button>
+
               <button className="px-3 py-2 rounded-xl border text-sm" onClick={()=>{
                 const t = getISOWeek(new Date());
                 setState(s => doRollover(s, t.year, t.week));
@@ -418,7 +556,6 @@
                               <div className="mt-2 flex items-center gap-2">
                                 <AssignWeek onAssign={(y,w)=>assignToWeek(t.id,y,w)} />
 
-                                {/* Bottone Note */}
                                 <button
                                   className="px-2 py-1 rounded-lg border text-xs"
                                   onClick={() => updateTask(t.id, { __showNotes: !t.__showNotes })}
@@ -429,7 +566,6 @@
                                 <button className="px-2 py-1 rounded-lg border text-xs" onClick={()=>removeTask(t.id)}>Elimina</button>
                               </div>
 
-                              {/* Editor note a comparsa */}
                               {t.__showNotes && (
                                 <div className="mt-2">
                                   <textarea
@@ -520,7 +656,7 @@
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-                  {/* Colonna sinistra: Attività settimana + Appuntamenti */}
+                  {/* Colonna sinistra */}
                   <div className="lg:col-span-2 space-y-4">
                     <div className="rounded-2xl border bg-white">
                       <div className="p-3 border-b">Attività della settimana</div>
@@ -556,7 +692,6 @@
                       </div>
                     </div>
 
-                    {/* Appuntamenti Studio (60' + note) */}
                     <div className="rounded-2xl border bg-white">
                       <div className="p-3 border-b">Appuntamenti Studio (durata 60')</div>
                       <div className="p-3 space-y-3">
@@ -609,7 +744,6 @@
                           const dt = dateForCell(view.year, view.week, weekdayIndex, slotIndex);
                           setCalendarTime(calendarFocusId, dt);
                         } else {
-                          // Creazione rapida appuntamento studio (60') con prompt per titolo e nota
                           const title = prompt("Titolo Appuntamento Studio (60'):");
                           if (title) {
                             const note = prompt("Nota (facoltativa):") || "";
@@ -623,10 +757,11 @@
                 </div>
 
                 <div className="text-xs text-slate-500">
-                  Nota: “Fatto” rimuove l’attività sia da <b>SETTIMANA</b> sia da <b>CICLI ATTIVI</b>.  
-                  Se non svolta entro la settimana, la riproporrò nella successiva in <span class="text-red-700">rosso</span> (orario da fissare).  
-                  Le attività <b>Q2</b> sono evidenziate in <span class="text-amber-700">giallo</span> e non si possono rimuovere dalla settimana.  
-                  Gli <b>Appuntamenti Studio</b> durano sempre <b>60 minuti</b>, hanno campo <b>Nota</b> e compaiono in <span class="text-violet-700">viola</span>.
+                  Nota: “Fatto” rimuove l’attività sia da <b>SETTIMANA</b> sia da <b>CICLI ATTIVI</b>.<br/>
+                  Se non svolta entro la settimana, la riproporrò nella successiva in <span class="text-red-700">rosso</span> (orario da fissare).<br/>
+                  Le attività <b>Q2</b> sono evidenziate in <span class="text-amber-700">giallo</span> e non si possono rimuovere dalla settimana.<br/>
+                  Gli <b>Appuntamenti Studio</b> durano sempre <b>60 minuti</b>, hanno campo <b>Nota</b> e compaiono in <span class="text-violet-700">viola</span>.<br/>
+                  I dati sono salvati in locale e sincronizzati anche su <b>Google Drive</b> tramite Apps Script.
                 </div>
               </section>
             )}
@@ -737,7 +872,6 @@
 
       return (
         <div className="w-full">
-          {/* Header giorni */}
           <div className="grid" style={{ gridTemplateColumns: '80px repeat(7, 1fr)' }}>
             <div className="bg-slate-100 border-b h-10 flex items-center justify-center text-xs text-slate-600">Ora</div>
             {Array.from({length:7}, (_,d)=>(
@@ -747,10 +881,8 @@
             ))}
           </div>
 
-          {/* Corpo: griglia oraria */}
           <div className="relative">
             <div className="grid" style={{ gridTemplateColumns: '80px repeat(7, 1fr)' }}>
-              {/* Colonna orari */}
               <div className="border-r">
                 {hours.map(h=>(
                   <div key={h} className="h-12 border-b text-[11px] text-slate-500 flex items-start justify-end pr-2">
@@ -759,10 +891,8 @@
                 ))}
               </div>
 
-              {/* 7 colonne dei giorni */}
               {Array.from({length:7}, (_,day)=>(
                 <div key={day} className="relative border-r" style={{ height: pxPerSlot*TOTAL_ROWS }}>
-                  {/* slot cliccabili */}
                   {slots.map(slot=>(
                     <div key={slot}
                          className={`border-b border-dashed ${slot%2===0?'bg-white':'bg-slate-50'}`}
@@ -772,7 +902,6 @@
                     </div>
                   ))}
 
-                  {/* blocchi attività con orario (30') */}
                   {tasks.filter(t => t.scheduled?.datetime && (cellForDatetime(t.scheduled.datetime).weekdayIndex === day))
                         .map(t=>{
                           const { top, height } = blockStyleFromDatetime(t.scheduled.datetime, TASK_DURATION_MIN);
@@ -784,8 +913,8 @@
                                  style={{
                                    top,
                                    height,
-                                   background: isQ2 ? '#FEF9C3' : '#DBEAFE',   // giallo-100 : azzurro-100
-                                   borderColor: isQ2 ? '#FDE68A' : '#93C5FD'   // giallo-300 : azzurro-300
+                                   background: isQ2 ? '#FEF9C3' : '#DBEAFE',
+                                   borderColor: isQ2 ? '#FDE68A' : '#93C5FD'
                                  }}
                                  title={t.text}>
                               <div className="truncate">{t.text}</div>
@@ -794,7 +923,6 @@
                           );
                         })}
 
-                  {/* blocchi appuntamenti studio (60' + note) */}
                   {study.filter(ev => cellForDatetime(ev.datetime).weekdayIndex === day)
                         .map(ev=>{
                           const { top, height } = blockStyleFromDatetime(ev.datetime, STUDY_DURATION_MIN);
@@ -806,8 +934,8 @@
                                  style={{
                                    top,
                                    height,
-                                   background: '#F5F3FF',   // violet-100
-                                   borderColor: '#C4B5FD'   // violet-300
+                                   background: '#F5F3FF',
+                                   borderColor: '#C4B5FD'
                                  }}
                                  title={tooltip}>
                               <div className="truncate">Studio: {ev.title}</div>
@@ -851,7 +979,6 @@
       );
     }
 
-    // ================== Mount ==================
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>
